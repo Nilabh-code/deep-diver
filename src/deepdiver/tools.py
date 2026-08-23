@@ -37,6 +37,9 @@ class RateGovernor:
 class Toolkit:
     """All external tools + a rate-governed httpx.AsyncClient, scope-guarded."""
 
+    # prefer Go-installed pentest binaries; .venv/bin shadows some names (httpx!)
+    TOOL_DIRS = ("/home/nil/go/bin", "/usr/local/bin", "/usr/bin", "/opt/bin")
+
     def __init__(self, guard: ScopeGuard, governor: RateGovernor, workdir: str, browser: bool = True):
         self.guard = guard
         self.gov = governor
@@ -74,7 +77,18 @@ class Toolkit:
                 ignore_https_errors=True)
         return self._browser_ctx
 
+    def _resolve_bin(self, name: str) -> str:
+        import os
+        if "/" in name:
+            return name
+        for d in self.TOOL_DIRS:
+            p = f"{d}/{name}"
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+        return name
+
     async def run_cmd(self, argv: Sequence[str], timeout: float = 180.0) -> "Result":
+        argv = [self._resolve_bin(argv[0]), *argv[1:]]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -104,6 +118,7 @@ class Toolkit:
 
     async def run_external_tool(self, name: str, args: list[str], timeout: float = 180.0) -> "Result":
         # scope-guard hosts embedded in args for the network tools
+        name = self._resolve_bin(name)
         cmd = [name, *args]
         return await self.run_cmd(cmd, timeout=timeout)
 
