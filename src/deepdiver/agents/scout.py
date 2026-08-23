@@ -18,14 +18,22 @@ class Scout(BaseAgent):
         target = plan.get("target") or self.surf.root_target
         p = urlparse(target if "://" in target else f"http://{target}")
         apex = p.hostname or target
+        if apex.startswith("www."):
+            apex = apex[4:]
         self.surf.root_target = apex
         summaries = []
         is_ip = re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", apex) is not None or apex == "localhost"
 
+        seed = f"{p.scheme or 'http'}://{p.netloc}" if p.netloc else \
+               (f"https://{apex}" if not is_ip else f"{p.scheme or 'http'}://{apex}")
+        r = await self.tk.fetch(seed, max_bytes=2000)
+        if r.ok and r.meta.get("status", 0) > 0:
+            final = (r.meta.get("final_url") or seed).rstrip("/").split("?")[0].split("#")[0]
+            self.surf.hosts.add(final)
+            self.surf.hosts.add(seed.rstrip("/"))
+
         if not self.surf.hosts:
             if is_ip or (p.scheme and p.port):
-                seed = f"{p.scheme or 'http'}://{p.netloc if p.netloc else apex}"
-                await self.say(f"single-host target: seeding {seed}")
                 self.surf.hosts.add(seed.rstrip("/"))
             else:
                 await self.say(f"enumerating subdomains for {apex}")
@@ -38,6 +46,17 @@ class Scout(BaseAgent):
                 if subs:
                     await self._probe_live(subs)
                     summaries.append(f"enumerated+probed {len(subs)} hosts, {len(self.surf.hosts)} live")
+        else:
+            await self.say(f"target host live: {seed} (fetching {apex} subdomains too)")
+            r = await self.tk.subfinder(apex, passive_only=True)
+            self.step()
+            subs = [s for s in r.output.splitlines() if s.strip()]
+            existing = {urlparse(h).hostname for h in self.surf.hosts}
+            fresh = [s for s in subs if s not in existing]
+            if fresh:
+                await self.say(f"subfinder found {len(fresh)} additional hosts, probing")
+                await self._probe_live(fresh[:60])
+            summaries.append(f"{len(self.surf.hosts)} live hosts")
 
         if not any(self.surf.ports.values()) and self.surf.hosts:
             await self._port_scan(list(self.surf.hosts)[:15])
