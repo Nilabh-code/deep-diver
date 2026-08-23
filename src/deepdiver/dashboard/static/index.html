@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>deep-diver</title>
+<style>
+:root{--bg:#0a0e12;--panel:#0f141a;--border:#1d2530;--text:#c9d1d9;--dim:#6e7681;
+--acc:#4ee2a0;--red:#ff5c5c;--yellow:#ffc857;--blue:#58a6ff;--purple:#bc8cff}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:14px/1.5 ui-monospace,'JetBrains Mono',monospace}
+header{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-bottom:1px solid var(--border)}
+header h1{font-size:18px;color:var(--acc);letter-spacing:1px}
+#status{font-size:12px;padding:4px 10px;border:1px solid var(--border);border-radius:999px}
+#status.on{color:var(--acc);border-color:var(--acc)}
+#status.off{color:var(--dim)}
+main{display:grid;grid-template-columns:360px 1fr 1fr;gap:12px;padding:14px;height:calc(100vh - 57px)}
+section{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;overflow-y:auto}
+h2{font-size:12px;text-transform:uppercase;color:var(--dim);letter-spacing:2px;margin-bottom:10px}
+label{display:block;font-size:12px;color:var(--dim);margin:8px 0 3px}
+input,textarea,select{width:100%;background:#0a0f14;border:1px solid var(--border);color:var(--text);
+padding:8px;border-radius:6px;font:inherit}
+textarea{resize:vertical}
+button{cursor:pointer;border:1px solid var(--acc);background:transparent;color:var(--acc);
+padding:8px 14px;border-radius:6px;font:inherit;margin-top:10px;margin-right:6px}
+button:hover{background:rgba(78,226,160,.12)}
+button.danger{border-color:var(--red);color:var(--red)}
+button.big{width:100%;padding:11px;font-weight:700}
+#feed{font-size:12.5px;white-space:pre-wrap;word-break:break-word}
+.ev{padding:2px 0;border-bottom:1px dashed #161d26}
+.ev .tag{display:inline-block;min-width:80px}
+.k-phase .tag{color:var(--blue)}.k-finding .tag{color:var(--acc)}
+.k-error .tag{color:var(--red)}.k-tool .tag{color:var(--purple)}.k-status .tag{color:var(--yellow)}
+#findings .f{border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px}
+.f .sev{float:right;font-weight:700;font-size:12px}
+.sev.critical{color:var(--red)}.sev.high{color:orange}.sev.medium{color:var(--yellow)}
+.sev.low{color:var(--blue)}.sev.informational{color:var(--dim)}
+.f .st{font-size:11px;color:var(--dim)}
+.st.confirmed{color:var(--acc);font-weight:700}
+small{color:var(--dim)}
+.row{display:flex;gap:8px}.row>*{flex:1}
+#llmState{font-size:11px;margin-top:6px;color:var(--dim)}
+</style>
+</head>
+<body>
+<header>
+  <h1>◢ deep-diver</h1>
+  <span id="status" class="off">idle</span>
+</header>
+<main>
+  <section>
+    <h2>Mission config</h2>
+    <label>Target URL / domain</label>
+    <input id="target" placeholder="https://example.com">
+    <label>Scope (comma/newline; prefix `-` to exclude; `!private` for lab/private networks)</label>
+    <textarea id="scope" rows="3" placeholder="example.com&#10;!private"></textarea>
+    <label>LLM base URL (any OpenAI-compatible)</label>
+    <input id="base_url" value="http://localhost:11434/v1">
+    <label>API key</label>
+    <input id="api_key" value="not-needed" type="password">
+    <label>Model</label>
+    <input id="model" value="qwen3-max">
+    <div class="row">
+      <div><label>Mode</label>
+        <select id="mode"><option value="quiet">quiet</option><option value="normal">normal</option><option value="aggressive" selected>aggressive</option></select></div>
+      <div><label>Budget (min)</label><input id="budget" type="number" value="60"></div>
+      <div><label>Max steps</label><input id="maxsteps" type="number" value="400"></div>
+    </div>
+    <label><input type="checkbox" id="browser" checked style="width:auto"> Browser agent (Playwright)</label>
+    <div id="llmState"></div>
+    <button onclick="pingLLM()">Ping LLM</button>
+    <button id="startBtn" class="big" onclick="start()">▶ LAUNCH HUNT</button>
+    <button id="stopBtn" class="danger" style="width:100%" onclick="stop()">■ KILL SWITCH</button>
+    <label>Report</label>
+    <button style="width:100%" onclick="loadReport()">load markdown report</button>
+    <pre id="reportPre" style="font-size:11px;white-space:pre-wrap;margin-top:6px"></pre>
+  </section>
+
+  <section>
+    <h2>Live feed</h2>
+    <div id="feed"></div>
+  </section>
+
+  <section>
+    <h2>Findings</h2>
+    <div id="findings"><small>no findings yet</small></div>
+  </section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let es=null;
+function connect(){
+  es=new EventSource('/api/events');
+  es.onmessage=e=>{
+    const d=JSON.parse(e.data);
+    const div=document.createElement('div');
+    div.className='ev k-'+d.kind;
+    const t=new Date(d.ts*1000).toLocaleTimeString();
+    div.innerHTML=`<span class="tag">[${d.kind}]</span> <small>${t}</small> <b>(${d.agent})</b> ${esc(d.message)}`;
+    const feed=$('feed'); feed.prepend(div);
+    while(feed.children.length>400) feed.lastChild.remove();
+    if(d.kind==='finding') refreshFindings();
+  };
+}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function body(){return {
+  target:$('target').value.trim(), scope:$('scope').value.trim(),
+  base_url:$('base_url').value.trim(), api_key:$('api_key').value,
+  model:$('model').value.trim(), mode:$('mode').value,
+  budget_minutes:+$('budget').value||60, max_steps:+$('maxsteps').value||400,
+  browser:$('browser').checked};}
+async function start(){
+  const r=await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body())});
+  const j=await r.json();
+  if(!r.ok) alert(j.error||'failed');
+  setStatus(r.ok);
+}
+async function stop(){ await fetch('/api/stop',{method:'POST'}); }
+async function pingLLM(){
+  $('llmState').textContent='pinging…';
+  const r=await fetch('/api/llm/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body())});
+  const j=await r.json();
+  $('llmState').textContent=j.ok?('ok — models: '+(j.models||[]).slice(0,6).join(', ')):'FAIL: '+j.error;
+}
+function setStatus(on){
+  const s=$('status');
+  s.textContent=on?'HUNTING':'idle'; s.className=on?'on':'off';
+  $('startBtn').disabled=on; $('stopBtn').disabled=!on;
+}
+async function refreshFindings(){
+  const r=await fetch('/api/state'); const j=await r.json();
+  setStatus(j.running);
+  const el=$('findings');
+  if(!j.findings||!j.findings.length){el.innerHTML='<small>no findings yet</small>';return}
+  el.innerHTML=j.findings.map(f=>`<div class="f">
+    <span class="sev ${f.severity}">${f.severity}</span>
+    <b>${esc(f.title)}</b><br>
+    <span class="st ${f.status}">${f.status}</span> · ${f.category} · cvss ${f.cvss}<br>
+    <small>${esc(f.endpoint)}</small></div>`).join('');
+}
+async function loadReport(){
+  const r=await fetch('/api/report');
+  $('reportPre').textContent=r.ok?await r.text():'no report yet';
+}
+const st=JSON.parse(localStorage.getItem('dv')||'{}');
+for(const k of ['target','scope','base_url','model']) if(st[k]!==undefined&&$(k)) $(k).value=st[k];
+setInterval(()=>localStorage.setItem('dv',JSON.stringify({target:$('target').value,scope:$('scope').value,base_url:$('base_url').value,model:$('model').value})),4000);
+connect(); refreshFindings();
+</script>
+</body>
+</html>
