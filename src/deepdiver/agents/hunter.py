@@ -52,6 +52,10 @@ class Hunter(BaseAgent):
 
     async def run(self, plan: dict) -> list[str]:
         actions = plan.get("actions", [])
+        if not actions and plan.get("action"):
+            actions = [{"action": plan["action"], "args": plan.get("args", {})}]
+        if isinstance(actions, dict):
+            actions = [actions]
         out = []
         for act in actions:
             if self.steps["used"] >= self.steps["max"]:
@@ -297,7 +301,7 @@ class Hunter(BaseAgent):
             body = r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output
             for m in secrets_re.finditer(body):
                 ctx = body[max(0, m.start() - 60):m.end() + 120]
-                if re.search(r"[=:]\s*["']?[A-Za-z0-9+/=._\-]{12,}", ctx):
+                if re.search(r"[=:]\s*['\"]?[A-Za-z0-9+/=._\-]{12,}", ctx):
                     hits += 1
                     await self.record(title=f"possible secret in JS {urlparse(u).path}",
                                       severity="medium", category="secrets", endpoint=u,

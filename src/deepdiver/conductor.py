@@ -27,18 +27,21 @@ You have these agents:
 - hunter: attack actions, each step is {"action":NAME,"args":{...}}; NAME is one of:
     nuclei_scan (args: tags,severity,urls), takeover_check, sensitive_files,
     test_sqli (args: max_urls), test_xss (max_urls), test_open_redirect (max_urls),
-    test_ssrf (max_urls), test_path_traversal (max_urls), http_method_fuzz (max_urls), admin_probe
+    test_ssrf (max_urls), test_path_traversal (max_urls), http_method_fuzz (max_urls),
+    admin_probe, path_brute (max_hosts), js_secrets
 - verifier: confirm/reject candidates
 - auditor: score + report
 
-Given the current attack surface, budget, and findings, respond JSON ONLY:
-{"agent": NAME, "plan": {...}, "why": "one sentence"}
+Given the current attack surface, budget, and findings, respond JSON ONLY with a BATCH of moves:
+{"moves": [{"agent": NAME, "plan": {...}, "why": "one sentence"}, ...]}
+You may return 1-6 moves; plan as many hunter actions as the surface justifies in one batch,
+e.g. {"agent":"hunter","plan":{"actions":[{"action":"test_sqli","args":{"max_urls":20}},{"action":"sensitive_files","args":{}}]}}
 Rules:
 - Recon before crawling; crawling before hunting; verify candidates before finishing.
 - Do not repeat actions already explored (check explored_actions).
 - Prefer actions matching what the surface suggests (param names hint at bug class).
 - Never act outside scope or target out-of-scope hosts.
-- If enough data has been gathered, command DONE: {"agent":"done","plan":{},"why":"..."}
+- If enough data has been gathered, command DONE: {"moves":[{"agent":"done","plan":{},"why":"..."}]}
 """
 
 
@@ -82,28 +85,33 @@ class Conductor:
         await self.bus.publish("status", "conductor",
                                f"scope allowlist domains={sorted(self.guard.domains)} hosts={sorted(self.guard.hosts)} private={self.guard.allow_private}")
         try:
-            # phase 1: deterministic scout pass, because llm may be flaky early
             await self.scout.run({"target": self.cfg.target})
             await self.cart.run({"hosts": sorted(self.surface.hosts)[:5]})
             while not self.kill.is_set() and time.time() < deadline and self.steps["used"] < self.steps["max"]:
-                move = await self._next_move()
-                if move is None:
-                    break
-                if move.get("agent") == "done":
-                    break
-                agent = self.agents.get(move.get("agent", ""))
-                if not agent:
-                    await self.bus.publish("error", "conductor", f"unknown agent in plan: {move}")
-                    continue
-                self.history.append(move)
-                plan = move.get("plan", {})
-                await self.bus.publish("phase", "conductor",
-                                       f"-> {agent.name}: {move.get('why', '')[:100]}")
-                summaries = await agent.run(plan)
-                for s in summaries or []:
-                    await self.bus.publish("log", agent.name, s)
-                if move["agent"] == "verifier":
-                    await self.auditor.run({})
+                moves = await self._next_round()
+                if not moves or any(m.get("agent") == "done" for m in moves):
+                    if moves and any(m.get("agent") == "done" for m in moves):
+                        break
+                    if not moves:
+                        break
+                for move in moves:
+                    if self.kill.is_set() or time.time() >= deadline:
+                        break
+                    if move.get("agent") == "done":
+                        continue
+                    agent = self.agents.get(move.get("agent", ""))
+                    if not agent:
+                        await self.bus.publish("error", "conductor", f"unknown agent in plan: {move}")
+                        continue
+                    self.history.append(move)
+                    plan = move.get("plan", {})
+                    await self.bus.publish("phase", "conductor",
+                                           f"-> {agent.name}: {move.get('why', '')[:100]}")
+                    summaries = await agent.run(plan)
+                    for s in summaries or []:
+                        await self.bus.publish("log", agent.name, s)
+                    if move["agent"] == "hunter":
+                        await self.verifier.run({})
             # final pass: verify + report
             await self.verifier.run({})
             await self.auditor.run({})
@@ -119,79 +127,86 @@ class Conductor:
             await self.tk.close()
             self.finished.set()
 
-    async def _next_move(self) -> dict | None:
+    async def _next_round(self) -> list[dict] | None:
         ctx = {
             "target": self.cfg.target,
             "steps_used": int(self.steps["used"]), "steps_max": self.steps["max"],
-            "hosts": sorted(self.surface.hosts)[:20],
-            "titles": {k: v[:60] for k, v in list(self.surface.titles.items())[:15]},
-            "tech": dict(list(self.surface.tech.items())[:15]),
+            "hosts": sorted(self.surface.hosts)[:15],
+            "tech": dict(list(self.surface.tech.items())[:10]),
             "urls_count": len(self.surface.urls),
             "urls_with_params": len([u for u in self.surface.urls if "?" in u]),
-            "js_endpoints": sorted(self.surface.js_endpoints)[:20],
-            "forms": self.surface.forms[:10],
-            "explored": sorted(self.surface.explored_actions)[-15:],
-            "findings": [(f.status, f.severity, f.category, f.title, f.endpoint)
-                         for f in self.findings.all()[-20:]],
+            "param_urls_sample": [u for u in sorted(self.surface.urls) if "?" in u][:12],
+            "js_endpoints": sorted(self.surface.js_endpoints)[:12],
+            "explored": sorted(self.surface.explored_actions)[-12:],
+            "findings": [(f.status, f.severity, f.category, f.title)
+                         for f in self.findings.all()[-15:]],
             "candidates": sum(1 for f in self.findings.all() if f.status == "candidate"),
-            "confirmed": sum(1 for f in self.findings.all() if f.status == "confirmed"),
         }
-        surf = self.surface.summary()
         prompt = (
-            f"Attack surface state:\n{surf}\n\n"
-            f"Summary: {json.dumps(ctx)[:3000]}\n\n"
-            f"History of plans so far ({len(self.history)}):\n"
-            + "\n".join(json.dumps(h)[:140] for h in self.history[-12:])
-            + "\n\nWhat is the next single best move? Reply JSON only."
+            f"Surface: {json.dumps(ctx)[:2600]}\n\n"
+            f"History:\n" + "\n".join(json.dumps(h)[:120] for h in self.history[-8:])
+            + "\n\nNext batch of moves? JSON only."
         )
-        for attempt in range(3):
+        for attempt in range(2):
             try:
-                move = await asyncio.to_thread(self.llm.ask_json, CONDUCTOR_SYSTEM, prompt)
-                if not isinstance(move, dict) or "agent" not in move:
-                    raise LLMError(f"bad plan shape: {str(move)[:200]}")
-                return move
-            except LLMError as e:
-                await self.bus.publish("error", "conductor", f"planning retry {attempt+1}: {e}")
-                await asyncio.sleep(2)
+                await self.bus.publish("status", "conductor", f"planning batch {len(self.history)+1} (attempt {attempt+1})…")
+                out = await asyncio.wait_for(
+                    asyncio.to_thread(self.llm.ask_json, CONDUCTOR_SYSTEM, prompt, 800),
+                    timeout=150)
+                if isinstance(out, dict) and "agent" in out:
+                    out = {"moves": [out]}
+                moves = (out or {}).get("moves") if isinstance(out, dict) else None
+                if not isinstance(moves, list) or not moves:
+                    raise LLMError(f"bad batch shape: {str(out)[:200]}")
+                return [m for m in moves if isinstance(m, dict) and "agent" in m][:6]
             except Exception as e:
-                await self.bus.publish("error", "conductor", f"planning error: {e}")
-                await asyncio.sleep(2)
-        # deterministic fallback: cycle hunt/verify based on state
-        return self._fallback_move()
+                await self.bus.publish("error", "conductor",
+                                       f"planning retry {attempt+1}: {type(e).__name__}: {str(e)[:150]}")
+                await asyncio.sleep(1)
+        await self.bus.publish("status", "conductor", "model unavailable — using deterministic hunt cycle")
+        return [self._fallback_move()]
+
+    def _hunted_actions(self) -> set[str]:
+        done = set()
+        for h in self.history:
+            if h.get("agent") != "hunter":
+                continue
+            plan = h.get("plan", {})
+            acts = plan.get("actions") or ([{"action": plan["action"]}] if plan.get("action") else [])
+            for a in acts:
+                if isinstance(a, dict) and a.get("action"):
+                    done.add(a["action"])
+        return done
 
     def _fallback_move(self) -> dict:
-        if self.findings.confirmed() or all(
-                f.status != "candidate" for f in self.findings.all()):
-            if self.steps["used"] > 3 and self.findings.confirmed():
-                return {"agent": "done", "plan": {}, "why": "fallback: nothing more to do"}
-        candidates = [f for f in self.findings.all() if f.status == "candidate"]
-        if candidates and len(self.history) > 0 and self.history[-1].get("agent") != "verifier":
-            return {"agent": "verifier", "plan": {}, "why": "fallback: verify candidates"}
-        # else hunt by surface hints
-        actions = []
-        if not any(h.get("plan", {}).get("action") == "sensitive_files" for h in self.history):
-            actions.append({"action": "sensitive_files", "args": {}})
-        param_urls = [u for u in self.surface.urls if "?" in u]
-        if param_urls:
-            actions += [
-                {"action": "test_sqli", "args": {"max_urls": 20}},
-                {"action": "test_xss", "args": {"max_urls": 20}},
-                {"action": "test_open_redirect", "args": {"max_urls": 10}},
-                {"action": "test_path_traversal", "args": {"max_urls": 10}},
-                {"action": "http_method_fuzz", "args": {"max_urls": 10}},
+        params_ready = bool([u for u in self.surface.urls if "?" in u])
+        if params_ready:
+            plan_actions = [
+                {"action": "sensitive_files", "args": {}},
+                {"action": "test_sqli", "args": {"max_urls": 25}},
+                {"action": "test_xss", "args": {"max_urls": 25}},
+                {"action": "test_open_redirect", "args": {"max_urls": 15}},
+                {"action": "test_path_traversal", "args": {"max_urls": 15}},
+                {"action": "test_ssrf", "args": {"max_urls": 10}},
+                {"action": "http_method_fuzz", "args": {"max_urls": 12}},
+                {"action": "admin_probe", "args": {}},
             ]
-        if self.surface.hosts:
-            actions.append({"action": "admin_probe", "args": {}})
-            actions.append({"action": "takeover_check", "args": {}})
-        if not actions:
-            return {"agent": "done", "plan": {}, "why": "fallback: surface empty"}
-        for i, a in enumerate(actions):
-            sig = f"hunter:{a['action']}"
-            if not any(h.get("agent") == "hunter" and
-                       (h.get("plan", {}).get("actions") or [{}])[0].get("action") == a["action"]
-                       for h in self.history):
-                return {"agent": "hunter", "plan": {"actions": [a]}, "why": f"fallback: {a['action']}"}
-        return {"agent": "done", "plan": {}, "why": "fallback: actions exhausted"}
+        else:
+            plan_actions = [
+                {"action": "sensitive_files", "args": {}},
+                {"action": "js_secrets", "args": {}},
+                {"action": "path_brute", "args": {"max_hosts": 3}},
+                {"action": "admin_probe", "args": {}},
+                {"action": "nuclei_scan", "args": {"severity": "medium,high,critical"}},
+            ]
+        remaining = [a for a in plan_actions if a["action"] not in self._hunted_actions()]
+        if remaining:
+            return {"agent": "hunter", "plan": {"actions": remaining[:6]},
+                    "why": "deterministic hunt cycle"}
+        candidates = [f for f in self.findings.all() if f.status == "candidate"]
+        if candidates and not any(h.get("agent") == "verifier" for h in self.history):
+            return {"agent": "verifier", "plan": {}, "why": "verify candidates"}
+        return {"agent": "done", "plan": {}, "why": "hunt cycle exhausted"}
 
     async def write_report(self) -> str:
         os.makedirs(self.workdir, exist_ok=True)
