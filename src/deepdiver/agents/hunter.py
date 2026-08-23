@@ -37,13 +37,13 @@ SSRF_MARKERS = ("ami-id", "instance-id", "ami-launch-index", "local-hostname",
                 "compute/metadata", '"project":', " VIA HTTP/1.1")
 
 SENSITIVE_PATHS = [
-    "/.git/config", "/.env", "/robots.txt", "/sitemap.xml", "/.well-known/security.txt",
-    "/config.json", "/backup.sql", "/db.sqlite3", "/.svn/entries", "/.DS_Store",
+    "/.git/config", "/.env", "/.svn/entries", "/.DS_Store",
     "/server-status", "/actuator/health", "/actuator/env", "/api/swagger.json",
     "/swagger-ui.html", "/graphql", "/debug/pprof/", "/trace", "/console/",
-    "/phpmyadmin/", "/admin/", "/wp-json/wp/v2/users", "/.aws/credentials",
+    "/phpmyadmin/", "/wp-json/wp/v2/users", "/.aws/credentials",
     "/application.properties", "/configuration.php", "/web.config", "/crossdomain.xml",
     "/clientaccesspolicy.xml", "/.npmrc", "/.pypirc", "/id_rsa", "/.ssh/id_rsa",
+    "/backup.sql", "/db.sqlite3", "/dump.sql", "/database.sql",
 ]
 
 
@@ -147,6 +147,10 @@ class Hunter(BaseAgent):
 
     def _looks_like_spafallback(self, url: str, ct: str, body: str, home_sig: set[str]) -> bool:
         low = body[:4000].lower()
+        # CDN/WAF challenge pages ("Just a moment...") are blocks, not disclosures.
+        if "just a moment" in low or "_cf_chl" in low or "challenge-platform" in low \
+                or "attention required" in low or "checking your browser" in low:
+            return True
         if "html" in ct and not url.lower().endswith((".html",)):
             titles = set(re.findall(r"<title>([^<]{4,80})</title>", low))
             if home_sig and titles and titles == home_sig:
@@ -503,7 +507,10 @@ class Hunter(BaseAgent):
             r"""private[_-]?key|client[_-]?secret\s*[:=])""", re.I)
         # framework/runtime constants that are NOT secrets
         fp_tokens = ("x-next-", "_n_t_", "x-resume", "revalidate", "middleware",
-                     "webpack", "sourcemap", "polyfill", "chunkhash")
+                     "webpack", "sourcemap", "polyfill", "chunkhash",
+                     "_updating_", "authentication=", "authorization=",
+                     "provider_proxy_config", "not_found", "invalid_", "error_code",
+                     "_found_for_provider")
         url_re = re.compile(r"""["'`](/(?:api|v\d|admin|auth|internal|debug)[A-Za-z0-9_\-./{}?$:=]*?)["'`]""")
         for u in jsfiles[:25]:
             r = await self.tk.fetch(u, max_bytes=700000)
