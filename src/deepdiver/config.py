@@ -19,6 +19,7 @@ class RunConfig:
     budget_minutes: int = 60
     max_steps: int = 400
     browser: bool = True
+    recon_only: bool = False
     report_dir: str = "runs"
 
     RATE = {"quiet": (1.0, 1.0), "normal": (4.0, 4.0), "aggressive": (12.0, 15.0)}

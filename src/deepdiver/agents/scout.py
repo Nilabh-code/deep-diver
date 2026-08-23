@@ -50,6 +50,10 @@ class Scout(BaseAgent):
         return summaries or ["no live hosts discovered"]
 
     async def _probe_live(self, hosts: list[str]):
+        hosts = [h for h in hosts if self.tk.guard.is_host_allowed(h)]
+        if not hosts:
+            await self.say("no in-scope hosts to probe")
+            return
         lst_path = f"{self.tk.workdir}/hosts.txt"
         with open(lst_path, "w") as f:
             f.write("\n".join(hosts))
@@ -68,6 +72,9 @@ class Scout(BaseAgent):
                 continue
             url = data.get("url", "")
             if not url:
+                continue
+            host = urlparse(url).hostname or ""
+            if not self.tk.guard.is_host_allowed(host):
                 continue
             self.surf.hosts.add(url.rstrip("/"))
             if data.get("title"):

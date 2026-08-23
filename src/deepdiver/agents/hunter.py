@@ -243,6 +243,7 @@ class Hunter(BaseAgent):
     async def a_test_xss(self, max_urls: int = 30) -> str:
         targets = await self._prepare_param_targets(max_urls)
         confirmed, candidates = 0, 0
+        exec_payload = f'"><img src=x onerror=window.__dvhit=1>'
         for url, params in targets:
             p = urlparse(url)
             for pname in list(params.keys())[:4]:
@@ -255,16 +256,28 @@ class Hunter(BaseAgent):
                     if not r.ok:
                         continue
                     body = r.output
-                    if payload in body or PROBE_ID in body:
+                    escaped = (payload.replace("<", "&lt;").replace(">", "&gt;") in body
+                               and payload not in body)
+                    if payload in body and not escaped:
                         ct = r.meta.get("headers", {}).get("content-type", "")
                         html = "html" in ct or "<html" in body.lower()[:2000]
-                        if html and (payload in body or f"{PROBE_ID}()" in body):
+                        executed = False
+                        if html and self.tk.browser:
+                            executed = await self._xss_execute(
+                                f"{p.scheme}://{p.netloc}{p.path}", pname, params)
+                        if html and executed:
                             confirmed += 1
                             await self.record(title=f"reflected XSS in parameter '{pname}'",
                                               severity="high", category="xss", endpoint=test_url,
-                                              evidence=body[:1500], repro=f"open: {test_url}",
-                                              impact="Session theft, phishing via reflected payload",
+                                              evidence=body[:1500],
+                                              repro=f"open in browser: {f'{p.scheme}://{p.netloc}{p.path}?'}{urlencode({**params, pname: exec_payload})}",
+                                              impact="Session theft, phishing via executed JS",
                                               cvss=7.5, status="confirmed")
+                        elif html:
+                            candidates += 1
+                            await self.record(title=f"unescaped reflection, no execution (CSP/context?) param={pname}",
+                                              severity="medium", category="xss", endpoint=test_url,
+                                              evidence=body[:600], status="candidate")
                         else:
                             candidates += 1
                             await self.record(title=f"xss payload reflected non-HTML param={pname}",
@@ -272,6 +285,28 @@ class Hunter(BaseAgent):
                                               evidence=body[:500], status="candidate")
                         break
         return f"xss: {confirmed} confirmed, {candidates} candidates over {len(targets)} urls"
+
+    async def _xss_execute(self, base: str, pname: str, params: dict) -> bool:
+        """Real browser execution check: injects an onerror payload and looks for
+        the marker the payload would set. Escaped output never fires."""
+        try:
+            q = dict(params)
+            q[pname] = '"><img src=x onerror=window.__dvhit=1>'
+            url = f"{base}?{urlencode(q)}"
+            self.tk.guard.check_url(url)
+            ctx = await self.tk._pctx()
+            page = await ctx.new_page()
+            try:
+                await page.goto(url, timeout=20000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(800)
+                hit = await page.evaluate("() => window.__dvhit === 1")
+                return bool(hit)
+            except Exception:
+                return False
+            finally:
+                await page.close()
+        except Exception:
+            return False
 
     async def a_path_brute(self, max_hosts: int = 4) -> str:
         common = "/home/nil/projects/deep-diver/wordlists/common.txt"

@@ -87,6 +87,13 @@ class Conductor:
         try:
             await self.scout.run({"target": self.cfg.target})
             await self.cart.run({"hosts": sorted(self.surface.hosts)[:5]})
+            if self.cfg.recon_only:
+                await self.bus.publish("status", "conductor",
+                                       "recon_only mode: skipping all hunting/attack phases")
+                self.report_path = await self.write_report()
+                await self.bus.publish("status", "conductor",
+                                       f"recon run complete, report={self.report_path}")
+                return
             while not self.kill.is_set() and time.time() < deadline and self.steps["used"] < self.steps["max"]:
                 moves = await self._next_round()
                 if not moves or any(m.get("agent") == "done" for m in moves):

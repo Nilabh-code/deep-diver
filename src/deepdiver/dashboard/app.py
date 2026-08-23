@@ -35,13 +35,14 @@ rt = Runtime()
 class StartBody(BaseModel):
     target: str
     scope: str = ""
-    base_url: str = "http://localhost:11434/v1"
+    base_url: str = "http://localhost:8888/v1"
     api_key: str = "not-needed"
-    model: str = "qwen3-max"
+    model: str = "ornith-ai/Ornith-1.5-35B-A3B-GGUF"
     mode: str = "aggressive"
     budget_minutes: int = 60
     max_steps: int = 400
     browser: bool = True
+    recon_only: bool = False
 
 
 def load_state() -> dict:
@@ -111,6 +112,7 @@ async def start(body: StartBody):
         llm=LLMConfig(base_url=body.base_url, api_key=body.api_key, model=body.model),
         mode=body.mode, budget_minutes=body.budget_minutes,
         max_steps=body.max_steps, browser=body.browser,
+        recon_only=body.recon_only,
         report_dir="runs",
     )
     rt.conductor = Conductor(cfg, bus, workdir="runs")

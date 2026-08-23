@@ -67,6 +67,7 @@ small{color:var(--dim)}
       <div><label>Max steps</label><input id="maxsteps" type="number" value="400"></div>
     </div>
     <label><input type="checkbox" id="browser" checked style="width:auto"> Browser agent (Playwright)</label>
+    <label><input type="checkbox" id="recon_only" style="width:auto"> Recon-only (no attack probes)</label>
     <div id="llmState"></div>
     <button onclick="pingLLM()">Ping LLM</button>
     <button id="startBtn" class="big" onclick="start()">▶ LAUNCH HUNT</button>
@@ -108,7 +109,7 @@ function body(){return {
   base_url:$('base_url').value.trim(), api_key:$('api_key').value,
   model:$('model').value.trim(), mode:$('mode').value,
   budget_minutes:+$('budget').value||60, max_steps:+$('maxsteps').value||400,
-  browser:$('browser').checked};}
+  browser:$('browser').checked, recon_only:$('recon_only').checked};}
 async function start(){
   const r=await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body())});
   const j=await r.json();

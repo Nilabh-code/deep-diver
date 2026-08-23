@@ -23,6 +23,8 @@ def main():
     run.add_argument("--budget", type=int, default=60, help="minutes")
     run.add_argument("--max-steps", type=int, default=400)
     run.add_argument("--no-browser", action="store_true")
+    run.add_argument("--recon-only", action="store_true",
+                     help="enumeration only: recon + crawl, zero attack probes")
 
     args = p.parse_args()
     if args.cmd == "serve":
@@ -40,7 +42,7 @@ def main():
                 target=args.target, scope=args.scope or args.target,
                 llm=LLMConfig(base_url=args.base_url, api_key=args.api_key, model=args.model),
                 mode=args.mode, budget_minutes=args.budget, max_steps=args.max_steps,
-                browser=not args.no_browser)
+                browser=not args.no_browser, recon_only=args.recon_only)
             c = Conductor(cfg, bus)
             await c.run()
 
