@@ -8,7 +8,7 @@ import re
 from openai import OpenAI
 
 
-DEFAULT_MODEL = "qwen3-max"
+DEFAULT_MODEL = "qwen3.8:27b"
 
 
 class LLMError(Exception):
@@ -45,9 +45,11 @@ def extract_json(text: str):
 
 
 class LLM:
-    def __init__(self, base_url: str, api_key: str, model: str = DEFAULT_MODEL, temperature: float = 0.1):
+    def __init__(self, base_url: str, api_key: str, model: str = DEFAULT_MODEL,
+                 temperature: float = 0.1, timeout: float = 300.0):
         self.model = model
-        self.client = OpenAI(base_url=base_url.rstrip("/"), api_key=api_key or "not-needed")
+        self.client = OpenAI(base_url=base_url.rstrip("/"), api_key=api_key or "not-needed",
+                             timeout=timeout, max_retries=1)
 
     def ping(self) -> list[str]:
         try:
@@ -64,6 +66,7 @@ class LLM:
                 temperature=0.1 if json_mode else 0.5,
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"} if json_mode else None,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
         except Exception as e:
             raise LLMError(str(e)) from e

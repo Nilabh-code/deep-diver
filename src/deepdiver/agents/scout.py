@@ -20,18 +20,24 @@ class Scout(BaseAgent):
         apex = p.hostname or target
         self.surf.root_target = apex
         summaries = []
+        is_ip = re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", apex) is not None or apex == "localhost"
 
         if not self.surf.hosts:
-            await self.say(f"enumerating subdomains for {apex}")
-            r = await self.tk.subfinder(apex, passive_only=True)
-            self.step()
-            subs = [s for s in r.output.splitlines() if s.strip()]
-            if apex not in subs:
-                subs.append(apex)
-            await self.say(f"subfinder found {len(subs)} hosts")
-            if subs:
-                await self._probe_live(subs)
-                summaries.append(f"enumerated+probed {len(subs)} hosts, {len(self.surf.hosts)} live")
+            if is_ip or (p.scheme and p.port):
+                seed = f"{p.scheme or 'http'}://{p.netloc if p.netloc else apex}"
+                await self.say(f"single-host target: seeding {seed}")
+                self.surf.hosts.add(seed.rstrip("/"))
+            else:
+                await self.say(f"enumerating subdomains for {apex}")
+                r = await self.tk.subfinder(apex, passive_only=True)
+                self.step()
+                subs = [s for s in r.output.splitlines() if s.strip()]
+                if apex not in subs:
+                    subs.append(apex)
+                await self.say(f"subfinder found {len(subs)} hosts")
+                if subs:
+                    await self._probe_live(subs)
+                    summaries.append(f"enumerated+probed {len(subs)} hosts, {len(self.surf.hosts)} live")
 
         if not any(self.surf.ports.values()) and self.surf.hosts:
             await self._port_scan(list(self.surf.hosts)[:15])

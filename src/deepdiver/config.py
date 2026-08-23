@@ -5,9 +5,9 @@ from dataclasses import dataclass, field
 
 @dataclass
 class LLMConfig:
-    base_url: str = "http://localhost:11434/v1"
-    api_key: str = "not-needed"
-    model: str = "qwen3-max"
+    base_url: str = "http://localhost:8888/v1"
+    api_key: str = "sk-unsloth-6c6aeb79cfcc184fcbc1c872e75d5a65"
+    model: str = "ornith-ai/Ornith-1.5-35B-A3B-GGUF"
 
 
 @dataclass

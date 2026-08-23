@@ -240,6 +240,80 @@ class Hunter(BaseAgent):
                         break
         return f"xss: {confirmed} confirmed, {candidates} candidates over {len(targets)} urls"
 
+    async def a_path_brute(self, max_hosts: int = 4) -> str:
+        common = "/home/nil/projects/deep-diver/wordlists/common.txt"
+        import os
+        if not os.path.exists(common):
+            return "wordlist missing"
+        found = 0
+        for host in sorted(self.surf.hosts)[:max_hosts]:
+            base = host.rstrip("/") + "/FUZZ"
+            r = await self.tk.ffuf(base, common,
+                                   mc="200,201,204,301,302,307,401,403,405")
+            self.step()
+            for line in r.output.splitlines():
+                m = re.match(r"(\d+)\s+(\d+)B\s+(.*)", line)
+                if not m:
+                    continue
+                status, size, url = m.groups()
+                url = url.strip()
+                if url and urlparse(url).path not in ("/", ""):
+                    self.surf.urls.add(url)
+                    found += 1
+                    if status in ("200", "301", "302", "401", "403"):
+                        await self.record(title=f"hidden path {urlparse(url).path}",
+                                          severity="informational", category="recon",
+                                          endpoint=url, evidence=f"HTTP {status} {size}B",
+                                          status="candidate")
+        return f"path-brute: {found} hidden paths added"
+
+    async def a_js_secrets(self) -> str:
+        """Scan discovered JS files for leaked secrets/endpoints via trufflehog."""
+        jsfiles = [u for u in self.surf.urls if u.rstrip().endswith(".js")]
+        if not jsfiles:
+            for host in sorted(self.surf.hosts)[:5]:
+                r = await self.tk.fetch(host, max_bytes=200000)
+                if r.ok:
+                    body = r.output
+                    for m in re.finditer(r"""(?:src|href)=["']([^"']+\.js)["']""", body):
+                        u = urllib.parse.urljoin(host, m.group(1))
+                        try:
+                            self.tk.guard.check_url(u)
+                            jsfiles.append(u)
+                        except Exception:
+                            pass
+            jsfiles = sorted(set(jsfiles))
+        if not jsfiles:
+            return "no js files"
+        hits = 0
+        secrets_re = re.compile(
+            r"""(aws_access_key_id|secret_access_key|api[_-]?key|password|passwd|token|bearer|authorization|private[_-]?key|client[_-]?secret)""", re.I)
+        url_re = re.compile(r"""["'`](/(?:api|v\d|admin|auth|internal|debug)[A-Za-z0-9_\-./{}?$:=]*?)["'`]""")
+        for u in jsfiles[:25]:
+            r = await self.tk.fetch(u, max_bytes=700000)
+            self.step(0.2)
+            if not r.ok:
+                continue
+            body = r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output
+            for m in secrets_re.finditer(body):
+                ctx = body[max(0, m.start() - 60):m.end() + 120]
+                if re.search(r"[=:]\s*["']?[A-Za-z0-9+/=._\-]{12,}", ctx):
+                    hits += 1
+                    await self.record(title=f"possible secret in JS {urlparse(u).path}",
+                                      severity="medium", category="secrets", endpoint=u,
+                                      evidence=ctx[:400], status="candidate")
+                    break
+            for em in url_re.finditer(body):
+                ep = em.group(1)
+                base = f"{urlparse(u).scheme}://{urlparse(u).netloc}"
+                full = base + ep.split("?")[0]
+                try:
+                    self.tk.guard.check_url(full)
+                    self.surf.js_endpoints.add(full)
+                except Exception:
+                    self.surf.js_endpoints.add(ep)
+        return f"js-secrets: {hits} candidates, +{len(self.surf.js_endpoints)} endpoints"
+
     async def a_test_open_redirect(self, max_urls: int = 20) -> str:
         confirmed = 0
         targets = await self._prepare_param_targets(max_urls)
