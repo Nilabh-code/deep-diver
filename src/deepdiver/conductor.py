@@ -152,7 +152,7 @@ class Conductor:
                 await self.bus.publish("status", "conductor", f"planning batch {len(self.history)+1} (attempt {attempt+1})…")
                 out = await asyncio.wait_for(
                     asyncio.to_thread(self.llm.ask_json, CONDUCTOR_SYSTEM, prompt, 800),
-                    timeout=150)
+                    timeout=240)
                 if isinstance(out, dict) and "agent" in out:
                     out = {"moves": [out]}
                 moves = (out or {}).get("moves") if isinstance(out, dict) else None

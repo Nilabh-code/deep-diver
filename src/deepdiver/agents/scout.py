@@ -78,9 +78,17 @@ class Scout(BaseAgent):
         await self.say(f"{len(self.surf.hosts)} live hosts confirmed")
 
     async def _port_scan(self, hosts: list[str]):
+        bare = []
+        for h in hosts:
+            try:
+                host = urlparse(h).hostname or h
+                bare.append(host)
+            except Exception:
+                bare.append(h)
+        bare = sorted(set(bare))
         lst = f"{self.tk.workdir}/portscan.txt"
         with open(lst, "w") as f:
-            f.write("\n".join(hosts))
+            f.write("\n".join(bare))
         r = await self.tk.run_external_tool(
             "naabu", ["-list", lst, "-silent", "-top-ports", "200",
                       "-rate", str(max(1, int(self.tk.gov.rps) * 10)), "-json"],

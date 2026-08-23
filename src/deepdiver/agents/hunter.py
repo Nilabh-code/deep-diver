@@ -114,22 +114,47 @@ class Hunter(BaseAgent):
     async def a_sensitive_files(self) -> str:
         hits = 0
         for host in sorted(self.surf.hosts)[:10]:
+            base = host.rstrip("/")
+            home_sig = await self._home_fingerprint(base)
             for path in SENSITIVE_PATHS:
-                url = host.rstrip("/") + path
+                url = base + path
                 r = await self.tk.fetch(url, max_bytes=8000)
                 self.step(0.1)
                 if not r.ok:
                     continue
                 status = r.meta.get("status", 0)
+                ct = r.meta.get("headers", {}).get("content-type", "")
                 body = r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output
-                if status in (200, 201) and self._interesting_sensitive(path, body, len(body)):
+                if status != 200:
+                    continue
+                if self._looks_like_spafallback(url, ct, body, home_sig):
+                    continue
+                if self._interesting_sensitive(path, body, len(body)):
                     hits += 1
                     await self.record(
                         title=f"sensitive file exposed: {path}",
                         severity=self._sensitive_sev(path),
                         category="misconfig", endpoint=url,
-                        evidence=f"HTTP {status}\n{body[:1500]}")
+                        evidence=f"HTTP {status} {ct}\n{body[:1500]}")
         return f"{hits} sensitive file hits"
+
+    async def _home_fingerprint(self, base: str) -> set[str]:
+        r = await self.tk.fetch(base, max_bytes=8000)
+        if not r.ok:
+            return set()
+        body = r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output
+        return set(re.findall(r'<title>([^<]{4,80})</title>', body)) or {"__home__"}
+
+    def _looks_like_spafallback(self, url: str, ct: str, body: str, home_sig: set[str]) -> bool:
+        low = body[:4000].lower()
+        if "html" in ct and not url.lower().endswith((".html",)):
+            titles = set(re.findall(r"<title>([^<]{4,80})</title>", low))
+            if home_sig and titles and titles == home_sig:
+                return True
+            if "<!doctype html" in low or ("<html" in low and "password" not in low
+                                             and "[core]" not in low):
+                return True
+        return False
 
     def _interesting_sensitive(self, path: str, body: str, length: int) -> bool:
         low = body.lower()
@@ -138,23 +163,27 @@ class Hunter(BaseAgent):
         markers = {
             "/.git/config": ("[core]", "[remote"),
             "/.env": ("=",),
-            "/robots.txt": ("disallow", "allow", "user-agent"),
+            "/robots.txt": ("disallow", "allow:", "user-agent"),
             "/server-status": ("apache server status", "uptime"),
-            "/actuator/health": ("status",),
-            "/actuator/env": ("property", "key"),
-            "/api/swagger.json": ("swagger", "openapi", "paths"),
-            "/graphql": ("query", "schema", "data"),
-            "/wp-json/wp/v2/users": ("id", "name", "slug"),
+            "/actuator/health": ('"status"',),
+            "/actuator/env": ('"property"', '"key"'),
+            "/api/swagger.json": ('"swagger"', '"openapi"', '"paths"'),
+            "/graphql": ('"data"', '"errors"', "query"),
+            "/wp-json/wp/v2/users": ('"id"', '"slug"'),
             "/crossdomain.xml": ("allow-access-from",),
         }
         for p, ms in markers.items():
             if path.startswith(p):
+                if "/.env" == p and "<html" in low:
+                    return False
                 return any(m in low for m in ms)
         if path in ("/.aws/credentials", "/id_rsa", "/.ssh/id_rsa", "/.npmrc", "/.pypirc"):
             return "aws_access" in low or "private key" in low or "_auth" in low
         if path.endswith((".sql", ".sqlite3")):
-            return length > 100
-        return any(m in low for m in ("password", "secret", "token", "dbname", "db_", "private key"))
+            return length > 100 and "<html" not in low
+        if "<html" in low and not any(k in low for k in ("password = ", "secret_key", "db_password", "apikey=")):
+            return False
+        return any(m in low for m in ("password", "secret", "token", "dbname", "private key"))
 
     def _sensitive_sev(self, path: str) -> str:
         if path in ("/.git/config", "/.env", "/.aws/credentials", "/id_rsa", "/.ssh/id_rsa",
@@ -301,7 +330,10 @@ class Hunter(BaseAgent):
             body = r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output
             for m in secrets_re.finditer(body):
                 ctx = body[max(0, m.start() - 60):m.end() + 120]
-                if re.search(r"[=:]\s*['\"]?[A-Za-z0-9+/=._\-]{12,}", ctx):
+                if re.search(r"[=:]\s*['\"]?[A-Za-z0-9+/=._\-]{16,}", ctx) and \
+                        any(w in ctx.lower() for w in
+                            ("key", "token", "passw", "secret", "bearer", "authorization")) and \
+                        "<html" not in body.lower()[:3000]:
                     hits += 1
                     await self.record(title=f"possible secret in JS {urlparse(u).path}",
                                       severity="medium", category="secrets", endpoint=u,
