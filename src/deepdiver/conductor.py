@@ -7,8 +7,10 @@ import time
 from dataclasses import dataclass
 
 from .agents import BaseAgent
+from .agents.apiscan import ApiScanner
 from .agents.cartographer import Cartographer
 from .agents.hunter import Hunter
+from .agents.origin import OriginHunter
 from .agents.scout import Scout
 from .agents.verify import Auditor, Verifier
 from .config import RunConfig
@@ -23,12 +25,16 @@ from .tools import RateGovernor, Toolkit
 CONDUCTOR_SYSTEM = """You are Conductor of an autonomous bug bounty agent. You plan the next move.
 You have these agents:
 - scout: subdomain/port/tech recon (action: {"agent":"scout","plan":{"target":"..."}})
+- origin: unmask origin IP behind CDN/WAF/load-balancers via cert transparency +
+  DNS + curl --resolve fingerprint verification ({"agent":"origin","plan":{"apex":"domain.tld"}})
+- apiscan: extract API routes from JS bundles, Next.js buildManifest, GraphQL
+  introspection, well-known/openapi discovery ({"agent":"apiscan","plan":{"hosts":[...]}})
 - cartographer: crawl hosts, map urls/params/js/forms ({"agent":"cartographer","plan":{"hosts":[...]}})
 - hunter: attack actions, each step is {"action":NAME,"args":{...}}; NAME is one of:
     nuclei_scan (args: tags,severity,urls), takeover_check, sensitive_files,
     test_sqli (args: max_urls), test_xss (max_urls), test_open_redirect (max_urls),
     test_ssrf (max_urls), test_path_traversal (max_urls), http_method_fuzz (max_urls),
-    admin_probe, path_brute (max_hosts), js_secrets
+    admin_probe, path_brute (max_hosts), js_secrets, api_probe (max_urls)
 - verifier: confirm/reject candidates
 - auditor: score + report
 
@@ -38,6 +44,8 @@ You may return 1-6 moves; plan as many hunter actions as the surface justifies i
 e.g. {"agent":"hunter","plan":{"actions":[{"action":"test_sqli","args":{"max_urls":20}},{"action":"sensitive_files","args":{}}]}}
 Rules:
 - Recon before crawling; crawling before hunting; verify candidates before finishing.
+- On CDN/WAF-fronted targets (e.g. Azure/Cloudflare IP) run origin early to find the real server IP.
+- On SPA/API stacks run apiscan to map endpoints the crawler cannot see.
 - Do not repeat actions already explored (check explored_actions).
 - Prefer actions matching what the surface suggests (param names hint at bug class).
 - Never act outside scope or target out-of-scope hosts.
@@ -60,11 +68,14 @@ class Conductor:
         self.llm = LLM(cfg.llm.base_url, cfg.llm.api_key, cfg.llm.model)
         self.scout = Scout(self.tk, self.surface, bus, self.findings, self.steps)
         self.cart = Cartographer(self.tk, self.surface, bus, self.findings, self.steps)
+        self.origin = OriginHunter(self.tk, self.surface, bus, self.findings, self.steps)
+        self.apiscan = ApiScanner(self.tk, self.surface, bus, self.findings, self.steps)
         self.hunter = Hunter(self.tk, self.surface, bus, self.findings, self.steps)
         self.verifier = Verifier(self.tk, self.surface, bus, self.findings, self.steps)
         self.auditor = Auditor(self.tk, self.surface, bus, self.findings, self.steps)
         self.agents = {a.name: a for a in
-                       (self.scout, self.cart, self.hunter, self.verifier, self.auditor)}
+                       (self.scout, self.cart, self.origin, self.apiscan,
+                        self.hunter, self.verifier, self.auditor)}
         self.kill = asyncio.Event()
         self.finished = asyncio.Event()
         self.history: list[dict] = []
@@ -87,6 +98,12 @@ class Conductor:
         try:
             await self.scout.run({"target": self.cfg.target})
             await self.cart.run({"hosts": sorted(self.surface.hosts)[:5]})
+            # always map APIs + try to unmask origin — cheap, high value, LLM-free
+            await self.apiscan.run({"hosts": sorted(self.surface.hosts)[:3]})
+            apex = self.surface.root_target
+            if apex.startswith("www."):
+                apex = apex[4:]
+            await self.origin.run({"apex": apex})
             if self.cfg.recon_only:
                 await self.bus.publish("status", "conductor",
                                        "recon_only mode: skipping all hunting/attack phases")
@@ -190,6 +207,7 @@ class Conductor:
         if params_ready:
             plan_actions = [
                 {"action": "sensitive_files", "args": {}},
+                {"action": "api_probe", "args": {"max_urls": 30}},
                 {"action": "test_sqli", "args": {"max_urls": 25}},
                 {"action": "test_xss", "args": {"max_urls": 25}},
                 {"action": "test_open_redirect", "args": {"max_urls": 15}},

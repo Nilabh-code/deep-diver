@@ -385,6 +385,47 @@ class Hunter(BaseAgent):
                     self.surf.js_endpoints.add(ep)
         return f"js-secrets: {hits} candidates, +{len(self.surf.js_endpoints)} endpoints"
 
+    async def a_api_probe(self, max_urls: int = 30) -> str:
+        """Route-breaker style: for every discovered /api|/internal|/v1 endpoint,
+        test auth status across methods + common param injection."""
+        base_urls = set()
+        for u in self.surf.js_endpoints:
+            lu = u.lower()
+            if any(k in lu for k in ("/api", "/internal", "/v1", "/admin")):
+                base_urls.add(u.split("?")[0])
+        base_urls |= {u.split("?")[0] for u in self.surf.urls
+                      if any(k in u.lower() for k in ("/api/", "/internal/", "/admin"))}
+        tested, issues = 0, 0
+        for url in sorted(base_urls)[:max_urls]:
+            if self.steps["used"] >= self.steps["max"]:
+                break
+            self.step(0.2)
+            tested += 1
+            results = {}
+            for method in ("GET", "POST"):
+                r = await self.tk.fetch(url, method=method, max_bytes=4000)
+                results[method] = (r.meta.get("status", 0),
+                                   (r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output)[:300])
+            get_st, get_body = results.get("GET", (0, ""))
+            post_st, post_body = results.get("POST", (0, ""))
+            if get_st == 200 and any(k in get_body.lower() for k in
+                                     ('"error"', '"detail"', '"message"', "stack", "traceback",
+                                      '"token"', '"password"', '"secret"')):
+                issues += 1
+                await self.record(title=f"API error/secret disclosure at {urlparse(url).path}",
+                                  severity="medium", category="info-disclosure", endpoint=url,
+                                  evidence=f"GET {get_st}\n{get_body}",
+                                  impact="Information disclosure from API response",
+                                  cvss=5.3, status="candidate")
+            elif get_st in (401, 403) and post_st == 200:
+                issues += 1
+                await self.record(title=f"possible auth bypass: GET {get_st} but POST 200 at {urlparse(url).path}",
+                                  severity="high", category="auth", endpoint=url,
+                                  evidence=f"GET->{get_st} POST->{post_st}\n{post_body[:400]}",
+                                  impact="Access control bypass via HTTP method",
+                                  cvss=7.0, status="candidate")
+        return f"api-probe: tested {tested}, {issues} issues"
+
     async def a_test_open_redirect(self, max_urls: int = 20) -> str:
         confirmed = 0
         targets = await self._prepare_param_targets(max_urls)

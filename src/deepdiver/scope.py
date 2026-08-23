@@ -16,6 +16,11 @@ class ScopeViolation(Exception):
 
 
 class ScopeGuard:
+    # recon infrastructure (cert transparency, IP geolocation, DNS-over-HTTPS).
+    # Read-only queries against public services; never probed/attacked.
+    HELPER_HOSTS = ("crt.sh", "ipinfo.io", "api.ipify.org", "dns.google",
+                    "cloudflare-dns.com", "rapiddns.io", "www.censys.io")
+
     def __init__(self):
         self.domains: set[str] = set()      # apex allowlist (apex covers subdomains)
         self.hosts: set[str] = set()        # exact hosts (e.g. IPs, localhost)
@@ -56,6 +61,8 @@ class ScopeGuard:
         host = (host or "").lower().strip(".")
         if not host:
             return False
+        if host in self.HELPER_HOSTS:
+            return True
         for ex in self.excluded:
             if host == ex or host.endswith("." + ex):
                 return False
