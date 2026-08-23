@@ -34,7 +34,9 @@ You have these agents:
     nuclei_scan (args: tags,severity,urls), takeover_check, sensitive_files,
     test_sqli (args: max_urls), test_xss (max_urls), test_open_redirect (max_urls),
     test_ssrf (max_urls), test_path_traversal (max_urls), http_method_fuzz (max_urls),
-    admin_probe, path_brute (max_hosts), js_secrets, api_probe (max_urls)
+    admin_probe, path_brute (max_hosts), js_secrets, api_probe (max_urls),
+    headers_cors (max_hosts), test_cmdi (max_urls), downgrade_check (max_hosts),
+    host_header (max_hosts), user_enum (max_hosts)
 - verifier: confirm/reject candidates
 - auditor: score + report
 
@@ -207,13 +209,18 @@ class Conductor:
         if params_ready:
             plan_actions = [
                 {"action": "sensitive_files", "args": {}},
+                {"action": "headers_cors", "args": {"max_hosts": 10}},
                 {"action": "api_probe", "args": {"max_urls": 30}},
                 {"action": "test_sqli", "args": {"max_urls": 25}},
                 {"action": "test_xss", "args": {"max_urls": 25}},
+                {"action": "test_cmdi", "args": {"max_urls": 20}},
                 {"action": "test_open_redirect", "args": {"max_urls": 15}},
                 {"action": "test_path_traversal", "args": {"max_urls": 15}},
                 {"action": "test_ssrf", "args": {"max_urls": 10}},
                 {"action": "http_method_fuzz", "args": {"max_urls": 12}},
+                {"action": "downgrade_check", "args": {"max_hosts": 8}},
+                {"action": "host_header", "args": {"max_hosts": 8}},
+                {"action": "user_enum", "args": {"max_hosts": 4}},
                 {"action": "admin_probe", "args": {}},
             ]
         else:

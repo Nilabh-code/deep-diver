@@ -210,6 +210,148 @@ class Hunter(BaseAgent):
                 break
         return targets
 
+    async def a_headers_cors(self, max_hosts: int = 10) -> str:
+        """Security header audit + CORS misconfig + cookie flag hygiene."""
+        issues = 0
+        for host in sorted(self.surf.hosts)[:max_hosts]:
+            if self.steps["used"] >= self.steps["max"]:
+                break
+            r = await self.tk.fetch(host, max_bytes=2000)
+            self.step(0.2)
+            if not r.ok:
+                continue
+            h = {k.lower(): str(v) for k, v in r.meta.get("headers", {}).items()}
+            hostname = urlparse(host).hostname or ""
+            if "x-frame-options" not in h and "frame-ancestors" not in h.get("content-security-policy", ""):
+                issues += 1
+                await self.record(title=f"clickjacking: no X-Frame-Options on {hostname}",
+                                  severity="low", category="clickjacking", endpoint=host,
+                                  evidence=json.dumps({k: v[:60] for k, v in h.items()}, indent=1)[:800],
+                                  impact="Page framable — clickjacking/UI-redress", cvss=4.3,
+                                  status="confirmed")
+            setc = h.get("set-cookie", "")
+            if setc and any(k in setc.lower() for k in ("session", "token", "sid=", "auth")):
+                if "httponly" not in setc.lower() or ("secure" not in setc.lower() and host.startswith("https://")):
+                    issues += 1
+                    await self.record(title=f"session cookie missing hardening flags on {hostname}",
+                                      severity="low", category="session", endpoint=host,
+                                      evidence=setc[:300],
+                                      impact="Cookie stealable via XSS/interception",
+                                      cvss=4.2, status="confirmed")
+            for origin in ("https://evil.attacker.example", "null"):
+                rr = await self.tk.fetch(host, headers={"Origin": origin}, max_bytes=1000)
+                self.step(0.1)
+                if not rr.ok:
+                    continue
+                rh = {k.lower(): str(v) for k, v in rr.meta.get("headers", {}).items()}
+                aco = rh.get("access-control-allow-origin", "")
+                if aco == origin and rh.get("access-control-allow-credentials", "").lower() == "true":
+                    issues += 1
+                    await self.record(title=f"CORS misconfig: reflects Origin {origin} with credentials",
+                                      severity="high" if "attacker" in origin else "medium",
+                                      category="cors", endpoint=host,
+                                      evidence=f"Origin: {origin}\nAccess-Control-Allow-Origin: {aco}\n"
+                                               f"Access-Control-Allow-Credentials: {rh.get('access-control-allow-credentials')}",
+                                      repro=f"curl -sk -H 'Origin: {origin}' {host} -D- | grep -i access-control",
+                                      impact="Cross-origin credentialed API read from attacker site",
+                                      cvss=7.4, status="confirmed", bounty_ready=True)
+        return f"headers/cors: {issues} issues across {min(max_hosts, len(self.surf.hosts))} hosts"
+
+    async def a_test_cmdi(self, max_urls: int = 25) -> str:
+        """OS command injection probes (echo-marker style, non-destructive)."""
+        confirmed = 0
+        targets = await self._prepare_param_targets(max_urls)
+        payloads = ["| echo dv42cmdi", "`echo dv42cmdi`", "$(echo dv42cmdi)",
+                    "%0Aecho%20dv42cmdi", "; echo dv42cmdi"]
+        for url, params in targets:
+            p = urlparse(url)
+            for pname in list(params.keys())[:3]:
+                for payload in payloads:
+                    q = dict(params)
+                    q[pname] = payload
+                    test_url = f"{p.scheme}://{p.netloc}{p.path}?{urlencode(q)}"
+                    r = await self.tk.fetch(test_url, max_bytes=50000)
+                    self.step(0.25)
+                    if r.ok and "dv42cmdi" in r.output:
+                        confirmed += 1
+                        await self.record(title=f"OS command injection in '{pname}'",
+                                          severity="critical", category="cmdi", endpoint=test_url,
+                                          evidence=r.output[:1500],
+                                          repro=f"curl -g '{test_url}' | grep dv42cmdi",
+                                          impact="Remote code execution on server", cvss=9.8,
+                                          status="confirmed", bounty_ready=True)
+                        break
+        return f"cmdi: {confirmed} confirmed over {len(targets)} urls"
+
+    async def a_downgrade_check(self, max_hosts: int = 8) -> str:
+        """Find hosts answering plaintext HTTP without redirect (SSL-strip surface)."""
+        found = 0
+        for host in sorted(self.surf.hosts)[:max_hosts]:
+            p = urlparse(host)
+            http_url = f"http://{p.netloc}/"
+            r = await self.tk.fetch(http_url, follow=False, max_bytes=1000)
+            self.step(0.1)
+            if not r.ok:
+                continue
+            st = r.meta.get("status", 0)
+            if st == 200:
+                found += 1
+                await self.record(title=f"plaintext HTTP servable at {p.netloc}",
+                                  severity="medium", category="downgrade", endpoint=http_url,
+                                  evidence=f"GET {http_url} -> 200 without HTTPS redirect",
+                                  impact="SSL-strip / MITM credential capture",
+                                  cvss=5.9, status="confirmed")
+        return f"downgrade: {found} hosts serving plaintext"
+
+    async def a_host_header(self, max_hosts: int = 8) -> str:
+        """Host header poisoning: forged Host echoed into response?"""
+        found = 0
+        evil = "dv42host.example"
+        for host in sorted(self.surf.hosts)[:max_hosts]:
+            r = await self.tk.fetch(host, headers={"X-Forwarded-Host": evil},
+                                    follow=False, max_bytes=8000)
+            self.step(0.1)
+            if r.ok and evil in r.output:
+                found += 1
+                await self.record(title=f"host header reflection at {urlparse(host).netloc}",
+                                  severity="medium", category="host-header", endpoint=host,
+                                  evidence=r.output[:800],
+                                  impact="Cache/password-reset poisoning via forged host",
+                                  cvss=5.4, status="confirmed")
+        return f"host-header: {found} reflections"
+
+    async def a_user_enum(self, max_hosts: int = 4) -> str:
+        """Login responses differing for known vs unknown accounts."""
+        found = 0
+        for host in sorted(self.surf.hosts)[:max_hosts]:
+            base = host.rstrip("/")
+            candidates = [
+                (f"{base}/api/auth/login", '{"email":"U","password":"dv42enum"}'),
+                (f"{base}/api/login", '{"email":"U","password":"dv42enum"}'),
+                (f"{base}/auth/login", '{"email":"U","password":"dv42enum"}'),
+                (f"{base}/login", "email=U&password=dv42enum"),
+            ]
+            for url, body in candidates:
+                ct = "application/json" if body.startswith("{") else "application/x-www-form-urlencoded"
+                resp = {}
+                for uname in ("admin@vaatun.com", "nosuchuser-dv42@nowhere.invalid"):
+                    r = await self.tk.fetch(url, method="POST",
+                                            headers={"Content-Type": ct},
+                                            data=body.replace("U", uname),
+                                            max_bytes=2000)
+                    self.step(0.2)
+                    resp[uname] = (r.meta.get("status", 0), (r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output)[:150])
+                (s1, b1), (s2, b2) = resp.get("admin@vaatun.com", (0, "")), resp.get("nosuchuser-dv42@nowhere.invalid", (0, ""))
+                if s1 and s1 != 404 and (s1 != s2 or b1 != b2):
+                    found += 1
+                    await self.record(title=f"user enumeration via login endpoint {urlparse(url).path}",
+                                      severity="low", category="auth", endpoint=url,
+                                      evidence=f"known-user: {s1} {b1!r}\nunknown-user: {s2} {b2!r}",
+                                      impact="Attacker validates which accounts exist",
+                                      cvss=3.7, status="candidate")
+                    break
+        return f"user-enum: {found} findings"
+
     async def a_test_sqli(self, max_urls: int = 30) -> str:
         targets = await self._prepare_param_targets(max_urls)
         confirmed, candidates = 0, 0
