@@ -47,15 +47,15 @@ class Scout(BaseAgent):
                     await self._probe_live(subs)
                     summaries.append(f"enumerated+probed {len(subs)} hosts, {len(self.surf.hosts)} live")
         else:
-            await self.say(f"target host live: {seed} (fetching {apex} subdomains too)")
-            r = await self.tk.subfinder(apex, passive_only=True)
+            await self.say(f"target host live: {seed} (enumerating {apex} subdomains)")
+            r = await self.tk.subfinder(apex, passive_only=False)
             self.step()
             subs = [s for s in r.output.splitlines() if s.strip()]
             existing = {urlparse(h).hostname for h in self.surf.hosts}
             fresh = [s for s in subs if s not in existing]
             if fresh:
                 await self.say(f"subfinder found {len(fresh)} additional hosts, probing")
-                await self._probe_live(fresh[:60])
+                await self._probe_live(fresh[:80])
             summaries.append(f"{len(self.surf.hosts)} live hosts")
 
         if not any(self.surf.ports.values()) and self.surf.hosts:

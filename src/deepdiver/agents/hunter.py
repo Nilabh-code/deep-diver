@@ -355,7 +355,13 @@ class Hunter(BaseAgent):
             return "no js files"
         hits = 0
         secrets_re = re.compile(
-            r"""(aws_access_key_id|secret_access_key|api[_-]?key|password|passwd|token|bearer|authorization|private[_-]?key|client[_-]?secret)""", re.I)
+            r"""(aws_access_key_id|secret_access_key|api[_-]?key\s*[:=]|apikey\s*[:=]|"""
+            r"""(?:password|passwd)\s*[:=]\s*['\"][^'\"]{6,}|token\s*[:=]\s*['\"][A-Za-z0-9_\-\.]{20,}|"""
+            r"""bearer\s+[a-z0-9_\-\.=+/]{20,}|authorization\s*[:=]\s*['\"]|"""
+            r"""private[_-]?key|client[_-]?secret\s*[:=])""", re.I)
+        # framework/runtime constants that are NOT secrets
+        fp_tokens = ("x-next-", "_n_t_", "x-resume", "revalidate", "middleware",
+                     "webpack", "sourcemap", "polyfill", "chunkhash")
         url_re = re.compile(r"""["'`](/(?:api|v\d|admin|auth|internal|debug)[A-Za-z0-9_\-./{}?$:=]*?)["'`]""")
         for u in jsfiles[:25]:
             r = await self.tk.fetch(u, max_bytes=700000)
@@ -365,6 +371,9 @@ class Hunter(BaseAgent):
             body = r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output
             for m in secrets_re.finditer(body):
                 ctx = body[max(0, m.start() - 60):m.end() + 120]
+                cl = ctx.lower()
+                if any(t in cl for t in fp_tokens):
+                    continue
                 if re.search(r"[=:]\s*['\"]?[A-Za-z0-9+/=._\-]{16,}", ctx) and \
                         any(w in ctx.lower() for w in
                             ("key", "token", "passw", "secret", "bearer", "authorization")) and \

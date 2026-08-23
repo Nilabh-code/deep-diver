@@ -19,7 +19,8 @@ class ScopeGuard:
     # recon infrastructure (cert transparency, IP geolocation, DNS-over-HTTPS).
     # Read-only queries against public services; never probed/attacked.
     HELPER_HOSTS = ("crt.sh", "ipinfo.io", "api.ipify.org", "dns.google",
-                    "cloudflare-dns.com", "rapiddns.io", "www.censys.io")
+                    "cloudflare-dns.com", "rapiddns.io", "www.censys.io",
+                    "web.archive.org", "otx.alienvault.com")
 
     def __init__(self):
         self.domains: set[str] = set()      # apex allowlist (apex covers subdomains)
