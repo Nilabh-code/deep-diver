@@ -262,29 +262,51 @@ class Hunter(BaseAgent):
         return f"headers/cors: {issues} issues across {min(max_hosts, len(self.surf.hosts))} hosts"
 
     async def a_test_cmdi(self, max_urls: int = 25) -> str:
-        """OS command injection probes (echo-marker style, non-destructive)."""
+        """OS command injection: time-based sleep detection first (reliable),
+        then unique-marker confirmation. Reflection alone is NOT cmdi."""
         confirmed = 0
         targets = await self._prepare_param_targets(max_urls)
-        payloads = ["| echo dv42cmdi", "`echo dv42cmdi`", "$(echo dv42cmdi)",
-                    "%0Aecho%20dv42cmdi", "; echo dv42cmdi"]
+        import time as _t
         for url, params in targets:
+            if self.steps["used"] >= self.steps["max"]:
+                break
             p = urlparse(url)
             for pname in list(params.keys())[:3]:
-                for payload in payloads:
-                    q = dict(params)
-                    q[pname] = payload
-                    test_url = f"{p.scheme}://{p.netloc}{p.path}?{urlencode(q)}"
-                    r = await self.tk.fetch(test_url, max_bytes=50000)
-                    self.step(0.25)
-                    if r.ok and "dv42cmdi" in r.output:
-                        confirmed += 1
-                        await self.record(title=f"OS command injection in '{pname}'",
-                                          severity="critical", category="cmdi", endpoint=test_url,
-                                          evidence=r.output[:1500],
-                                          repro=f"curl -g '{test_url}' | grep dv42cmdi",
-                                          impact="Remote code execution on server", cvss=9.8,
-                                          status="confirmed", bounty_ready=True)
-                        break
+                q0 = dict(params)
+                base_url = f"{p.scheme}://{p.netloc}{p.path}?{urlencode(q0)}"
+                t0 = _t.monotonic()
+                r0 = await self.tk.fetch(base_url, max_bytes=1000)
+                baseline = _t.monotonic() - t0
+                if not r0.ok:
+                    continue
+                q1 = dict(params)
+                q1[pname] = f"{params[pname]} | sleep 4"
+                test_url = f"{p.scheme}://{p.netloc}{p.path}?{urlencode(q1)}"
+                t1 = _t.monotonic()
+                r1 = await self.tk.fetch(test_url, max_bytes=1000)
+                elapsed = _t.monotonic() - t1
+                self.step(0.5)
+                if not r1.ok or elapsed < max(3.5, baseline + 3):
+                    continue
+                marker = f"dv42c{abs(hash((url, pname))) % 9999}x"
+                q2 = dict(params)
+                q2[pname] = f"{params[pname]} | echo {marker}"
+                conf_url = f"{p.scheme}://{p.netloc}{p.path}?{urlencode(q2)}"
+                r2 = await self.tk.fetch(conf_url, max_bytes=40000)
+                self.step(0.3)
+                body2 = r2.output
+                execed = marker in body2 and f"echo {marker}" not in body2 \
+                    and f"| echo {marker}" not in body2
+                confirmed += 1
+                await self.record(title=f"OS command injection in '{pname}'",
+                                  severity="critical", category="cmdi", endpoint=test_url,
+                                  evidence=f"baseline: {baseline:.1f}s vs sleep-payload: {elapsed:.1f}s\n"
+                                           f"marker confirmation: {'YES' if execed else 'time-based only'}\n"
+                                           f"probe url: {test_url}",
+                                  repro=f"measure: curl -g '{test_url}' (delayed ~4s)\n"
+                                        f"confirm: curl -g '{conf_url}' | grep {marker}",
+                                  impact="Remote code execution — full server compromise",
+                                  cvss=9.8, status="confirmed", bounty_ready=True)
         return f"cmdi: {confirmed} confirmed over {len(targets)} urls"
 
     async def a_downgrade_check(self, max_hosts: int = 8) -> str:

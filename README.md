@@ -1,90 +1,59 @@
 # deep-diver
 
-Multi-agent autonomous bug bounty hunter. Give it a company URL; it reconnoiters,
-crawls, forms attack hypotheses, tests them safely, verifies, and writes a
-bounty-grade report. Built for legal use against bug bounty programs and assets
-you own — every tool call passes a default-deny scope guard.
+Autonomous multi-agent bug bounty hunter. Give it a URL you own or a bounty
+program scope — it reconnoiters, crawls, unmasks CDN origins, hunts, verifies,
+and writes a bounty-grade report with an executive summary.
 
-## Architecture
+## Quick start (self-service)
 
-```
-                    ┌────────────┐
-  you (dashboard)──▶│  Conductor │◀── LLM (any OpenAI-compatible endpoint)
-                    └─────┬──────┘
-                          │ plans the next move until exhausted
-        ┌────────┬────────┼────────┬─────────┐
-        ▼        ▼        ▼        ▼         ▼
-     Scout  Cartographer Hunter  Verifier  Auditor
-   subdomains  crawl    attack   confirm   CVSS +
-   ports/tech  forms    probes   or reject  report
+```bash
+# dashboard — open, paste URL, LAUNCH HUNT
+./start.sh                          # http://localhost:8911
+
+# one-shot scan from terminal
+./scan.sh https://target.example.com
+./scan.sh https://target.example.com --budget 90 --recon-only
+./scan.sh https://target.example.com --cred-email test@co.com --cred-password 'pw'
 ```
 
-- **Conductor** — LLM-driven planner. Reads the attack surface state + history,
-  emits the next single agent move. Deterministic fallback cycle if the model
-  is silent, so the hunt never stalls.
-- **Scout** — subfinder → httpx → naabu → tech fingerprinting.
-- **Cartographer** — katana link crawl + Playwright browser crawl (JS-rendered
-  pages, forms, XHR/API endpoints, JS-file endpoint extraction).
-- **Hunter** — nuclei scans, takeover checks, sensitive files, SQLi/XSS/open-
-  redirect/SSRF/path-traversal param probes, HTTP method fuzzing, unauth admin
-  panels, path brute-force, JS secret scanning. Detection-only payloads;
-  nothing destructive, no credential attacks.
-- **Verifier** — re-tests every candidate, keeps only reproducible evidence.
-- **Auditor** — CVSS scoring + markdown report per run.
+Reports land in `./runs/report-<runid>.md`.
 
-**Scope guard** (`src/deepdiver/scope.py`): default-deny allowlist. Every
-fetch/URL/host is asserted in-scope before any request leaves the process.
-`!private` in the scope string permits localhost/private ranges (labs only).
-The LLM cannot talk its way around the guard — it's enforced in the tool layer.
+## Agents
+
+| agent | role |
+|---|---|
+| Conductor | LLM planner — batches moves, deterministic fallback cycle |
+| Scout | subfinder (-all), httpx live probing, naabu ports, fingerprinting |
+| Cartographer | katana + Playwright browser crawl, forms, XHR/API endpoints |
+| OriginHunter | CDN/WAF unmask: crt.sh/archive.org/OTX hostnames → DNS → ipinfo org filtering → curl --resolve + bare-IP/Host verification + CDN-header diffing |
+| ApiScanner | Next.js buildManifest, JS-chunk route harvest, GraphQL introspection, API wordlist brute, shadow-AI endpoints |
+| CveMatcher | fingerprints → NVD CVE lookups (garak/pentest-gpt style vuln intel) |
+| AiProbe | safe garak-style AI exposure: marker-prompt liveness, model-list leaks |
+| AuthProbe | Playwright login with your creds → session capture → IDOR sweep (strix-style); pre-auth BAC probes when no creds |
+| Hunter | takeover, sensitive files, SQLi, XSS (browser-execution confirmed), SSRF, path traversal, cmdi (time-based + marker), open redirect, method fuzz, CORS/clickjacking/cookie headers, downgrade, host-header, user enum, path brute, JS secrets |
+| Verifier | re-tests every candidate, rejects WAF challenge pages + unreachable |
+| Auditor | CVSS scoring, LLM executive summary, markdown report |
+
+## Safety
+
+- **Default-deny scope guard** in the tool layer — the LLM cannot escape it.
+- Detection payloads only (markers/time-delays), no DoS, no brute force, no shells.
+- `--recon-only`: enumeration only, zero attack probes.
+- `--mode quiet|normal|aggressive` → rate governor caps every request.
+- Kill switch in the dashboard.
 
 ## Install
 
 ```bash
-uv sync
-uv run playwright install chromium
-
-# external tools (Arch example)
-go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-go install github.com/projectdiscovery/katana/cmd/katana@latest
-go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+uv sync && uv run playwright install chromium
+# go tools (Arch: yaourt-style from bin)
+go install github.com/projectdiscovery/{subfinder/v2/cmd/subfinder,httpx/cmd/httpx,katana/cmd/katana,nuclei/v3/cmd/nuclei,naabu/v2/cmd/naabu}@latest
 go install github.com/ffuf/ffuf/v2@latest
 git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates ~/nuclei-templates
-# sqlmap, trufflehog, dalfox optional — Hunter degrades gracefully without them
-```
-
-## Usage
-
-Web dashboard (recommended):
-
-```bash
-uv run deepdiver serve --port 8911    # http://localhost:8911
-```
-
-Enter target, scope, and LLM endpoint (base URL + API key + model — any
-OpenAI-compatible: local llama.cpp/ollama/unsloth, or cloud), then LAUNCH.
-Live event feed, findings board, kill switch, markdown report.
-
-Headless:
-
-```bash
-uv run deepdiver run https://target.example.com \
-  --scope "target.example.com,-staging.target.example.com" \
-  --base-url http://localhost:8888/v1 --api-key $KEY --model MODEL \
-  --mode aggressive --budget 120
 ```
 
 ## Laws of the diver
 
-1. Only targets you explicitly put in scope. The guard is default-deny.
-2. Only bug bounty programs or assets you own/have written permission on.
-3. Detection payloads only: markers, errors, harmless reflections. No DoS, no
-   credential brute-force, no data exfiltration, no deployment of shells.
-4. Rate-governed even in aggressive mode. Respect the program's policy.
-5. Findings stay local until *you* submit them through the program's channel.
-
-## Status
-
-Built and validated against DVWA + OWASP Juice Shop in docker. This is an
-aggressive research tool — review findings manually before any disclosure.
+1. Only targets in your written scope (bounty program, or assets you own).
+2. Recon before hunting; verify before reporting.
+3. Findings stay local until *you* submit them through the program's channel.
