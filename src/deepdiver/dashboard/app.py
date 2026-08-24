@@ -43,6 +43,8 @@ class StartBody(BaseModel):
     max_steps: int = 400
     browser: bool = True
     recon_only: bool = False
+    cred_email: str = ""
+    cred_password: str = ""
 
 
 def load_state() -> dict:
@@ -113,6 +115,8 @@ async def start(body: StartBody):
         mode=body.mode, budget_minutes=body.budget_minutes,
         max_steps=body.max_steps, browser=body.browser,
         recon_only=body.recon_only,
+        credentials=({"email": body.cred_email, "password": body.cred_password}
+                     if body.cred_email else {}),
         report_dir="runs",
     )
     rt.conductor = Conductor(cfg, bus, workdir="runs")
@@ -145,6 +149,6 @@ async def report():
     return JSONResponse({"error": "no report yet"}, status_code=404)
 
 
-def serve(port: int = 8911):
+def serve(port: int = 8911, host: str = "0.0.0.0"):
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    uvicorn.run(app, host=host, port=port, log_level="warning")

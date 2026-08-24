@@ -29,6 +29,10 @@ class OriginHunter(BaseAgent):
     """
     name = "origin"
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._probed_ips: set[str] = set()
+
     async def run(self, plan: dict) -> list[str]:
         apex = plan.get("apex") or self.surf.root_target
         if apex.startswith("www."):
@@ -70,42 +74,78 @@ class OriginHunter(BaseAgent):
             if org and any(c in org.lower() for c in PURE_CDN_ORGS):
                 self.surf.add_note(f"{ip} is pure CDN ({org}) — {len(hosts)} hosts fronted")
                 continue
+            if ip in self._probed_ips:
+                continue
+            self._probed_ips.add(ip)
             res = await self._probe_cluster(ip, sorted(hosts), org)
             out.extend(res)
         return out or ["no direct origins unmasked"]
 
     async def _probe_cluster(self, ip: str, hosts: list[str], org: str) -> list[str]:
         found = []
-        for host in hosts[:3]:
+        # deep-verify on the richest host first; ONE finding per IP cluster
+        best = None
+        for host in sorted(hosts)[:4]:
             probe = await self._curl_resolve(ip, host, "/")
             if probe is None:
                 continue
             status, title, headers, length = probe
-            if status not in (200, 301, 302, 401, 403, 500):
+            if status not in (200, 301, 302, 401, 403, 500) or length < 100:
                 continue
-            # compare with normal-DNS resolution of the same host
             normal = await self._curl_normal(host)
-            diff = ""
-            if normal:
-                n_status, n_title, _, _ = normal
-                if n_status == status and n_title == title:
-                    diff = "same-as-cdn-view"
-                else:
-                    diff = f"DIFFERS from CDN view ({n_status}/{n_title!r})"
-            endpoint = f"https://{host} (ip {ip}, org={org or '?'})"
-            await self.record(
-                title=f"direct origin access: {host} -> {ip} ({'CDN-bypass' if 'DIFFERS' in diff else 'direct-service'})",
-                severity="high" if "DIFFERS" in diff else "medium",
-                category="origin-disclosure", endpoint=endpoint,
-                evidence=f"curl --resolve {host}:443:{ip} -> HTTP {status} | title: {title!r}\n"
-                         f"server headers: {json.dumps({k: v for k, v in (headers or {}).items() if k.lower() in ('server','x-powered-by','via','www-authenticate')}, indent=1)}\n"
-                         f"body {length}B | comparison: {diff or 'n/a'}",
-                repro=f"curl -sk --resolve {host}:443:{ip} https://{host}/ -o /dev/null -w '%{{http_code}}'",
-                impact="WAF/CDN bypass: origin server reachable directly — rate limits, "
-                       "WAF rules and IP allowlists on the front door do not apply",
-                cvss=7.2 if "DIFFERS" in diff else 6.0, status="confirmed", bounty_ready=True)
-            found.append(f"origin/service {host}@{ip}")
+            # header-level CDN evidence: does the normal view show CDN headers
+            # while the --resolve view does NOT?
+            cdn_hdrs = ("cf-ray", "x-cache", "via", "x-azure-ref", "x-amz-cf-id",
+                        "cf-cache-status", "x-fastly")
+            normal_is_cdn = any(h in (normal[2] if normal else {}) for h in cdn_hdrs)
+            resolve_is_cdn = any(h in (headers or {}) for h in cdn_hdrs)
+            bypass = normal_is_cdn and not resolve_is_cdn
+            differs = bool(normal) and (normal[0] != status or normal[1] != title)
+            if best is None or bypass or differs:
+                best = (host, status, title, headers, length, normal, bypass, differs)
+        if best is None:
+            return found
+        host, status, title, headers, length, normal, bypass, differs = best
+        # extra probe: bare-IP + Host header (works even if SNI-based routing)
+        host_probe = await self._bare_ip_probe(ip, host)
+        sig_hdrs = {k: v for k, v in (headers or {}).items()
+                    if k in ("server", "x-powered-by", "via", "www-authenticate")}
+        self.surf.add_note(
+            f"origin {ip} verified serving {host} "
+            f"({'CDN-bypass' if bypass else 'direct'}/{'DIFFERS' if differs else 'same'}"
+            f"/host-hdr:{'yes' if host_probe else 'no'}, org={org})")
+        sev = "high" if bypass else ("medium" if differs else "medium")
+        await self.record(
+            title=f"origin exposure: {ip} serves {host}"
+                  f"{' — WAF/CDN bypass' if bypass else ''}",
+            severity=sev, category="origin-disclosure",
+            endpoint=f"https://{host} (ip {ip}, org={org or '?'})",
+            evidence=(
+                f"curl --resolve {host}:443:{ip} -> HTTP {status} title={title!r} len={length}B\n"
+                f"origin headers: {json.dumps(sig_hdrs, indent=1)}\n"
+                f"bare-IP+Host probe: {host_probe or 'no-route'}\n"
+                f"CDN headers present on normal view: {normal_is_cdn}, on origin view: {resolve_is_cdn}\n"
+                f"view differs from public: {differs}\n"
+                f"cluster hosts on {ip}: {', '.join(sorted(hosts)[:8])}"),
+            repro=f"curl -sk --resolve {host}:443:{ip} https://{host}/ -o /dev/null -w '%{{http_code}}'\n"
+                  f"curl -sk https://{ip}/ -H 'Host: {host}' -o /dev/null -w '%{{http_code}}' -k",
+            impact="WAF/CDN bypass or direct origin exposure: rate limits, WAF rules and "
+                   "front-door IP allowlists do not apply to this path",
+            cvss=7.2 if (bypass or differs) else 6.0, status="confirmed", bounty_ready=True)
+        found.append(f"origin verified {ip} -> {host} ({len(hosts)} hosts)")
         return found
+
+    async def _bare_ip_probe(self, ip: str, host: str) -> str | None:
+        cmd = ["curl", "-sk", "--max-time", "8", f"https://{ip}/", "-H", f"Host: {host}",
+               "-o", "/dev/null", "-w", "%{http_code}"]
+        r = await self.tk.run_cmd(cmd, timeout=12)
+        self.step(0.1)
+        if not r.ok:
+            return None
+        code = r.output.strip()
+        if code.isdigit() and int(code) > 0:
+            return code
+        return None
 
     async def _curl_resolve(self, ip: str, host: str, path: str):
         cmd = ["curl", "-sk", "--max-time", "12", "--resolve", f"{host}:443:{ip}",

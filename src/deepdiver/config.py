@@ -20,6 +20,7 @@ class RunConfig:
     max_steps: int = 400
     browser: bool = True
     recon_only: bool = False
+    credentials: dict = field(default_factory=dict)   # {"email": ..., "password": ...}
     report_dir: str = "runs"
 
     RATE = {"quiet": (1.0, 1.0), "normal": (4.0, 4.0), "aggressive": (12.0, 15.0)}

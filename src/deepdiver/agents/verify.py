@@ -12,6 +12,10 @@ class Verifier(BaseAgent):
     reproducibility, never performs destructive actions."""
     name = "verifier"
 
+    BLOCK_MARKERS = ("just a moment", "_cf_chl", "checking your browser",
+                     "challenge-platform", "attention required", "access denied",
+                     "rate limited", "too many requests")
+
     async def run(self, plan: dict) -> list[str]:
         out = []
         for f in list(self.findings.all()):
@@ -45,17 +49,25 @@ class Verifier(BaseAgent):
                 return "confirmed"
             f.status = "rejected"
             return "no evidence on retest, rejected"
-        if ct in ("misconfig", "auth", "nuclei", "takeover"):
-            r = await self.tk.fetch(f.endpoint, max_bytes=4000)
-            self.step(0.3)
-            if r.ok and r.meta.get("status", 0) in (200, 301, 302, 401, 403):
-                f.status = "confirmed"
-                f.bounty_ready = f.severity in ("medium", "high", "critical")
-                return "confirmed"
-            f.status = "rejected"
-            return "not reachable, rejected"
-        f.status = "confirmed"
-        return "auto-confirmed"
+        # misconfig / auth / nuclei / takeover / secrets etc: re-check reachability
+        r = await self.tk.fetch(f.endpoint, max_bytes=8000)
+        self.step(0.3)
+        if r.ok and r.meta.get("status", 0) in (200, 301, 302, 401, 403):
+            low = (r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output).lower()[:3000]
+            if any(m in low for m in self.BLOCK_MARKERS):
+                f.status = "rejected"
+                return "WAF challenge page, rejected"
+            f.status = "confirmed"
+            f.cvss = f.cvss or self._base_cvss(f.severity)
+            f.bounty_ready = f.severity in ("medium", "high", "critical")
+            return "confirmed"
+        f.status = "rejected"
+        return "not reachable, rejected"
+
+    @staticmethod
+    def _base_cvss(severity: str) -> float:
+        return {"critical": 9.3, "high": 7.8, "medium": 5.4, "low": 3.1,
+                "informational": 1.0}.get(severity, 1.0)
 
     def _evidence_matches(self, ct: str, f, body: str, meta: dict) -> bool:
         low = body.lower()

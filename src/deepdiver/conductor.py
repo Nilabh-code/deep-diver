@@ -7,8 +7,11 @@ import time
 from dataclasses import dataclass
 
 from .agents import BaseAgent
+from .agents.aiprobe import AiProbe
 from .agents.apiscan import ApiScanner
+from .agents.authprobe import AuthProbe
 from .agents.cartographer import Cartographer
+from .agents.cvemap import CveMatcher
 from .agents.hunter import Hunter
 from .agents.origin import OriginHunter
 from .agents.scout import Scout
@@ -72,6 +75,10 @@ class Conductor:
         self.cart = Cartographer(self.tk, self.surface, bus, self.findings, self.steps)
         self.origin = OriginHunter(self.tk, self.surface, bus, self.findings, self.steps)
         self.apiscan = ApiScanner(self.tk, self.surface, bus, self.findings, self.steps)
+        self.cvemap = CveMatcher(self.tk, self.surface, bus, self.findings, self.steps)
+        self.aiprobe = AiProbe(self.tk, self.surface, bus, self.findings, self.steps)
+        self.authprobe = AuthProbe(self.tk, self.surface, bus, self.findings, self.steps,
+                                   credentials=cfg.credentials)
         self.hunter = Hunter(self.tk, self.surface, bus, self.findings, self.steps)
         self.verifier = Verifier(self.tk, self.surface, bus, self.findings, self.steps)
         self.auditor = Auditor(self.tk, self.surface, bus, self.findings, self.steps)
@@ -106,6 +113,9 @@ class Conductor:
             if apex.startswith("www."):
                 apex = apex[4:]
             await self.origin.run({"apex": apex})
+            await self.cvemap.run({})
+            await self.aiprobe.run({})
+            await self.authprobe.run({})
             if self.cfg.recon_only:
                 await self.bus.publish("status", "conductor",
                                        "recon_only mode: skipping all hunting/attack phases")
@@ -240,12 +250,40 @@ class Conductor:
             return {"agent": "verifier", "plan": {}, "why": "verify candidates"}
         return {"agent": "done", "plan": {}, "why": "hunt cycle exhausted"}
 
+    async def _executive_summary(self, confirmed: list, cands: list) -> str:
+        facts = [f"{f.severity}|{f.category}|{f.title}|{f.endpoint}" for f in confirmed[:40]]
+        prompt = (
+            f"Target: {self.cfg.target}\n"
+            f"Confirmed findings ({len(confirmed)}):\n" + "\n".join(facts) +
+            f"\nCandidates: {len(cands)}\nHosts: {len(self.surface.hosts)}, "
+            f"URLs: {len(self.surface.urls)}\n\n"
+            "Write a 3-5 sentence security executive summary in plain markdown. "
+            "Highlight the most exploitable issues first, note remediation priority."
+        )
+        try:
+            text = await asyncio.wait_for(
+                asyncio.to_thread(self.llm.ask,
+                                  "You are a senior security engineer writing a pentest "
+                                  "executive summary. Be concrete, no fluff, no JSON.",
+                                  prompt, False, 700),
+                timeout=180)
+            return text.strip()
+        except Exception:
+            if not confirmed:
+                return "_No confirmed findings in this run._"
+            top = confirmed[0]
+            return (f"Hunt confirmed {len(confirmed)} findings, highest: "
+                    f"**{top.title}** ({top.severity}, CVSS {top.cvss}) at `{top.endpoint}`. "
+                    f"API endpoints discovered: {len(self.surface.js_endpoints)}. "
+                    f"Recommend prioritizing origin-disclosure and access-control items.")
+
     async def write_report(self) -> str:
         os.makedirs(self.workdir, exist_ok=True)
         path = f"{self.workdir}/report-{self.run_id}.md"
         confirmed = self.findings.confirmed()
         confirmed.sort(key=lambda f: -f.cvss)
         cands = [f for f in self.findings.all() if f.status == "candidate"]
+        summary = await self._executive_summary(confirmed, cands)
         lines = [
             f"# deep-diver security report",
             f"",
@@ -255,6 +293,10 @@ class Conductor:
             f"- mode: {self.cfg.mode} | steps: {int(self.steps['used'])}/{self.steps['max']}",
             f"- live hosts: {len(self.surface.hosts)} | urls: {len(self.surface.urls)}",
             f"- findings: **{len(confirmed)} confirmed**, {len(cands)} candidates",
+            "",
+            "## Executive summary",
+            "",
+            summary,
             "",
             "## Confirmed findings",
             "",
