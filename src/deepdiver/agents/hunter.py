@@ -34,7 +34,8 @@ REDIRECT_PAYLOADS = [
 ]
 
 SSRF_MARKERS = ("ami-id", "instance-id", "ami-launch-index", "local-hostname",
-                "compute/metadata", '"project":', " VIA HTTP/1.1")
+                "computeMetadata", '"project":', '"osType"', '"machineType"',
+                '"vmSize"', "droplet_id", '"ssh_keys"', " VIA HTTP/1.1")
 
 SENSITIVE_PATHS = [
     "/.git/config", "/.env", "/.svn/entries", "/.DS_Store",
@@ -102,7 +103,10 @@ class Hunter(BaseAgent):
     async def a_takeover_check(self) -> str:
         hosts = [h.replace("https://", "").replace("http://", "") for h in self.surf.hosts]
         subs = hosts
-        r = await self.tk.nuclei([f"http://{s}" for s in subs[:30]], tags="takeover",
+        targets = []
+        for s in subs[:20]:
+            targets += [f"http://{s}", f"https://{s}"]
+        r = await self.tk.nuclei(targets, tags="takeover",
                                  template_dir="/home/nil/nuclei-templates")
         self.step()
         hits = [l for l in r.output.splitlines() if l.strip()]
@@ -263,8 +267,12 @@ class Hunter(BaseAgent):
 
     async def a_test_cmdi(self, max_urls: int = 25) -> str:
         """OS command injection: time-based sleep detection first (reliable),
-        then unique-marker confirmation. Reflection alone is NOT cmdi."""
+        then unique-marker confirmation. Reflection alone is NOT cmdi.
+        Time-based-only results are recorded as candidates (the verifier
+        re-tests timing twice before confirming); only marker execution
+        earns an immediate confirmed."""
         confirmed = 0
+        cands = 0
         targets = await self._prepare_param_targets(max_urls)
         import time as _t
         for url, params in targets:
@@ -297,17 +305,24 @@ class Hunter(BaseAgent):
                 body2 = r2.output
                 execed = marker in body2 and f"echo {marker}" not in body2 \
                     and f"| echo {marker}" not in body2
-                confirmed += 1
+                if execed:
+                    confirmed += 1
+                else:
+                    cands += 1
                 await self.record(title=f"OS command injection in '{pname}'",
                                   severity="critical", category="cmdi", endpoint=test_url,
                                   evidence=f"baseline: {baseline:.1f}s vs sleep-payload: {elapsed:.1f}s\n"
                                            f"marker confirmation: {'YES' if execed else 'time-based only'}\n"
-                                           f"probe url: {test_url}",
+                                           f"probe url: {test_url}\n"
+                                           f"baseline_url: {base_url}\n"
+                                           f"conf_url: {conf_url}",
                                   repro=f"measure: curl -g '{test_url}' (delayed ~4s)\n"
                                         f"confirm: curl -g '{conf_url}' | grep {marker}",
                                   impact="Remote code execution — full server compromise",
-                                  cvss=9.8, status="confirmed", bounty_ready=True)
-        return f"cmdi: {confirmed} confirmed over {len(targets)} urls"
+                                  cvss=9.8 if execed else 8.1,
+                                  status="confirmed" if execed else "candidate",
+                                  bounty_ready=execed)
+        return f"cmdi: {confirmed} confirmed, {cands} time-only candidates over {len(targets)} urls"
 
     async def a_downgrade_check(self, max_hosts: int = 8) -> str:
         """Find hosts answering plaintext HTTP without redirect (SSL-strip surface)."""
@@ -347,8 +362,11 @@ class Hunter(BaseAgent):
         return f"host-header: {found} reflections"
 
     async def a_user_enum(self, max_hosts: int = 4) -> str:
-        """Login responses differing for known vs unknown accounts."""
+        """Login responses differing for known vs unknown accounts. One endpoint
+        per host is tested (whichever answers first) to keep auth attempts minimal."""
         found = 0
+        apex = self.surf.root_target or ""
+        known = f"admin@{apex}" if apex else "admin@vaatun.com"
         for host in sorted(self.surf.hosts)[:max_hosts]:
             base = host.rstrip("/")
             candidates = [
@@ -360,22 +378,24 @@ class Hunter(BaseAgent):
             for url, body in candidates:
                 ct = "application/json" if body.startswith("{") else "application/x-www-form-urlencoded"
                 resp = {}
-                for uname in ("admin@vaatun.com", "nosuchuser-dv42@nowhere.invalid"):
+                for uname in (known, "nosuchuser-dv42@nowhere.invalid"):
                     r = await self.tk.fetch(url, method="POST",
                                             headers={"Content-Type": ct},
                                             data=body.replace("U", uname),
                                             max_bytes=2000)
                     self.step(0.2)
                     resp[uname] = (r.meta.get("status", 0), (r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output)[:150])
-                (s1, b1), (s2, b2) = resp.get("admin@vaatun.com", (0, "")), resp.get("nosuchuser-dv42@nowhere.invalid", (0, ""))
-                if s1 and s1 != 404 and (s1 != s2 or b1 != b2):
+                (s1, b1), (s2, b2) = resp.get(known, (0, "")), resp.get("nosuchuser-dv42@nowhere.invalid", (0, ""))
+                if not s1 or s1 == 404:
+                    continue
+                if s1 != s2 or b1 != b2:
                     found += 1
                     await self.record(title=f"user enumeration via login endpoint {urlparse(url).path}",
                                       severity="low", category="auth", endpoint=url,
                                       evidence=f"known-user: {s1} {b1!r}\nunknown-user: {s2} {b2!r}",
                                       impact="Attacker validates which accounts exist",
                                       cvss=3.7, status="candidate")
-                    break
+                break
         return f"user-enum: {found} findings"
 
     async def a_test_sqli(self, max_urls: int = 30) -> str:
@@ -394,7 +414,7 @@ class Hunter(BaseAgent):
                         confirmed += 1
                         await self.record(
                             title=f"SQL injection in parameter '{pname}'",
-                            severity="critical" if "error" in str(SQLI_ERRORS.pattern) else "high",
+                            severity="critical",
                             category="sqli", endpoint=test_url,
                             evidence=r.output[:2000],
                             repro=f"curl -g '{test_url}'",
@@ -540,7 +560,10 @@ class Hunter(BaseAgent):
             if not r.ok:
                 continue
             body = r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output
+            file_hits = 0
             for m in secrets_re.finditer(body):
+                if file_hits >= 3:
+                    break
                 ctx = body[max(0, m.start() - 60):m.end() + 120]
                 cl = ctx.lower()
                 if any(t in cl for t in fp_tokens):
@@ -550,10 +573,10 @@ class Hunter(BaseAgent):
                             ("key", "token", "passw", "secret", "bearer", "authorization")) and \
                         "<html" not in body.lower()[:3000]:
                     hits += 1
+                    file_hits += 1
                     await self.record(title=f"possible secret in JS {urlparse(u).path}",
                                       severity="medium", category="secrets", endpoint=u,
                                       evidence=ctx[:400], status="candidate")
-                    break
             for em in url_re.finditer(body):
                 ep = em.group(1)
                 base = f"{urlparse(u).scheme}://{urlparse(u).netloc}"
@@ -562,7 +585,7 @@ class Hunter(BaseAgent):
                     self.tk.guard.check_url(full)
                     self.surf.js_endpoints.add(full)
                 except Exception:
-                    self.surf.js_endpoints.add(ep)
+                    pass
         return f"js-secrets: {hits} candidates, +{len(self.surf.js_endpoints)} endpoints"
 
     async def a_api_probe(self, max_urls: int = 30) -> str:
@@ -570,6 +593,8 @@ class Hunter(BaseAgent):
         test auth status across methods + common param injection."""
         base_urls = set()
         for u in self.surf.js_endpoints:
+            if "://" not in u:
+                continue
             lu = u.lower()
             if any(k in lu for k in ("/api", "/internal", "/v1", "/admin")):
                 base_urls.add(u.split("?")[0])
@@ -579,6 +604,10 @@ class Hunter(BaseAgent):
         for url in sorted(base_urls)[:max_urls]:
             if self.steps["used"] >= self.steps["max"]:
                 break
+            try:
+                self.tk.guard.check_url(url)
+            except Exception:
+                continue
             self.step(0.2)
             tested += 1
             results = {}
@@ -598,12 +627,16 @@ class Hunter(BaseAgent):
                                   impact="Information disclosure from API response",
                                   cvss=5.3, status="candidate")
             elif get_st in (401, 403) and post_st == 200:
-                issues += 1
-                await self.record(title=f"possible auth bypass: GET {get_st} but POST 200 at {urlparse(url).path}",
-                                  severity="high", category="auth", endpoint=url,
-                                  evidence=f"GET->{get_st} POST->{post_st}\n{post_body[:400]}",
-                                  impact="Access control bypass via HTTP method",
-                                  cvss=7.0, status="candidate")
+                pb = post_body.strip().lower()
+                real_content = len(post_body.strip()) > 120 and not any(
+                    k in pb[:220] for k in ('"error"', '"forbidden"', '"not found"', "denied"))
+                if real_content:
+                    issues += 1
+                    await self.record(title=f"possible auth bypass: GET {get_st} but POST 200 at {urlparse(url).path}",
+                                      severity="high", category="auth", endpoint=url,
+                                      evidence=f"GET->{get_st} POST->{post_st}\n{post_body[:400]}",
+                                      impact="Access control bypass via HTTP method",
+                                      cvss=7.0, status="candidate")
         return f"api-probe: tested {tested}, {issues} issues"
 
     async def a_test_open_redirect(self, max_urls: int = 20) -> str:
@@ -643,8 +676,11 @@ class Hunter(BaseAgent):
                 if not any(k in pname.lower() for k in urlish):
                     continue
                 for meta_url in ("http://169.254.169.254/latest/meta-data/",
+                                 "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
                                  "http://169.254.169.254/metadata/v1.json",
-                                 "http://metadata.google.internal/computeMetadata/v1/"):
+                                 "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+                                 "http://metadata.google.internal/computeMetadata/v1/",
+                                 "http://100.100.100.200/latest/meta-data/"):
                     q = dict(params)
                     q[pname] = meta_url
                     test_url = f"{p.scheme}://{p.netloc}{p.path}?{urlencode(q)}"
@@ -711,10 +747,16 @@ class Hunter(BaseAgent):
                                       severity="low", category="misconfig", endpoint=base,
                                       evidence=f"GET->{gs} {method}->{as_}", status="candidate")
                 elif as_ in (200, 204) and gs in (403, 401):
+                    ab = (ar.output.split("\n\n", 1)[1] if "\n\n" in ar.output else ar.output)
+                    abl = ab.strip().lower()
+                    real_content = len(ab.strip()) > 120 and not any(
+                        k in abl[:220] for k in ('"error"', '"forbidden"', '"not found"', "denied"))
+                    if not real_content:
+                        continue
                     found += 1
                     await self.record(title=f"auth bypass: {method} bypasses access control",
                                       severity="medium", category="auth", endpoint=base,
-                                      evidence=f"GET->{gs} {method}->{as_}",
+                                      evidence=f"GET->{gs} {method}->{as_}\n{ab[:300]}",
                                       impact="Possible BAC bypass", status="candidate")
         return f"method-fuzz: {found} interesting across {min(max_urls, len(interesting))} urls"
 

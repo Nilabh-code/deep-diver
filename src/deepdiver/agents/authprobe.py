@@ -103,15 +103,15 @@ class AuthProbe(BaseAgent):
         return "; ".join(f"{k}={v}" for k, v in self.session_cookies.items())
 
     async def _preauth_bac(self, plan: dict) -> list[str]:
-        """Probe obviously-sensitive API paths WITHOUT auth — catches what even an
+        """Probe obviously sensitive API paths WITHOUT auth — catches what even an
         unauthenticated attacker gets (route-breaker style)."""
         issues = []
-        id_paths = ("/api/users/1", "/api/user/1", "/api/accounts/1", "/api/orders/1",
-                    "/api/products/1", "/api/customers/1", "/api/sessions/1")
+        id_paths = ("/users/1", "/user/1", "/accounts/1", "/orders/1",
+                    "/products/1", "/customers/1", "/sessions/1")
         for host in sorted(self.surf.hosts)[:5]:
             base = host.rstrip("/")
-            api_roots = [f"{base}/api", f"{base}/api/v1", f"{base}"]
-            for root in api_roots[:1]:
+            api_roots = [f"{base}/api", f"{base}/api/v1", base]
+            for root in api_roots:
                 for p in id_paths:
                     url = root + p
                     r = await self.tk.fetch(url, max_bytes=2000)

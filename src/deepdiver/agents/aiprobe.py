@@ -35,6 +35,8 @@ class AiProbe(BaseAgent):
         pat = re.compile(r"/(v1/(models|chat|completions|embeddings)|api/tags|api/chat|"
                          r"api/generate|gradio|api/openai|v1/chat/completions|mcp|llm)\b", re.I)
         for u in list(self.surf.urls) + list(self.surf.js_endpoints):
+            if "://" not in u:
+                continue
             if pat.search(urlparse(u).path):
                 urls.add(u.split("?")[0])
         for host in self.surf.hosts:
@@ -43,6 +45,10 @@ class AiProbe(BaseAgent):
         return urls
 
     async def _probe(self, url: str) -> str | None:
+        try:
+            self.tk.guard.check_url(url)
+        except Exception:
+            return None
         path = urlparse(url).path.lower()
         if path.rstrip("/").endswith("/models") or path.rstrip("/").endswith("/api/tags"):
             return await self._list_models(url)
@@ -61,7 +67,10 @@ class AiProbe(BaseAgent):
             status = r.meta.get("status", 0)
             out = r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output
             low = out.lower()[:2000]
-            if status == 200 and ("dv42aialive" in low or '"content"' in low or '"response"' in low):
+            if status == 200 and ("dv42aialive" in low or '"choices"' in low or
+                                  ('"content"' in low and '"usage"' in low) or
+                                  ('"response"' in low and
+                                   ('"model"' in low or '"created_at"' in low))):
                 leaked = self._info_leak(low)
                 await self.record(
                     title=f"AI inference endpoint reachable at {urlparse(url).netloc}{urlparse(url).path}",

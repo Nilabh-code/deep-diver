@@ -17,6 +17,11 @@ class ApiScanner(BaseAgent):
         hosts = plan.get("hosts") or sorted(self.surf.hosts)[:3]
         out = []
         for host in hosts:
+            try:
+                self.tk.guard.check_url(host if "://" in host else f"https://{host}")
+            except Exception:
+                await self.say(f"skipping out-of-scope api target: {host}", kind="error")
+                continue
             await self.say(f"api mapping {host}")
             n1 = await self._nextjs_routes(host)
             n2 = await self._js_route_harvest(host)
@@ -106,7 +111,8 @@ class ApiScanner(BaseAgent):
                                     headers={"Content-Type": "application/json"},
                                     data=introspect, max_bytes=30000)
             self.step(0.2)
-            if r.ok and ('"__schema"' in r.output or '"data"' in r.output):
+            if r.ok and ('"__schema"' in r.output or
+                         ('"queryType"' in r.output and '"types"' in r.output)):
                 found += 1
                 body = r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output
                 types = re.findall(r'"name":"([A-Za-z0-9_]+)"', body)[:20]

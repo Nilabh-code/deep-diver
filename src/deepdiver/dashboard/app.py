@@ -8,19 +8,48 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from ..config import LLMConfig, RunConfig
+from ..config import LLMConfig, RunConfig, _default_api_key
 from ..conductor import Conductor
 from ..events import EventBus
 from ..llm import LLM
 
 STATE_FILE = Path.home() / ".config" / "deep-diver" / "state.json"
+TOKEN_FILE = Path.home() / ".config" / "deep-diver" / "token"
 
 app = FastAPI(title="deep-diver")
 bus = EventBus()
 STATIC = Path(__file__).parent / "static"
+
+
+def _token() -> str:
+    """Auth token from DEEPDIVER_TOKEN env or ~/.config/deep-diver/token.
+    Empty = auth disabled (only safe when bound to loopback)."""
+    t = os.getenv("DEEPDIVER_TOKEN", "")
+    if not t:
+        try:
+            t = TOKEN_FILE.read_text().strip()
+        except Exception:
+            pass
+    return t
+
+
+def _authorized(request: Request) -> bool:
+    t = _token()
+    if not t:
+        return True
+    if request.headers.get("x-dv-token", "") == t:
+        return True
+    return request.query_params.get("token", "") == t
+
+
+@app.middleware("http")
+async def require_token(request: Request, call_next):
+    if request.url.path.startswith("/api/") and not _authorized(request):
+        return JSONResponse({"error": "bad or missing token (X-DV-Token)"}, status_code=401)
+    return await call_next(request)
 
 
 class Runtime:
@@ -36,7 +65,7 @@ class StartBody(BaseModel):
     target: str
     scope: str = ""
     base_url: str = "http://localhost:8888/v1"
-    api_key: str = "not-needed"
+    api_key: str = Field(default_factory=_default_api_key)
     model: str = "ornith-ai/Ornith-1.5-35B-A3B-GGUF"
     mode: str = "aggressive"
     budget_minutes: int = 60

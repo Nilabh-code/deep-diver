@@ -20,7 +20,7 @@ from .config import RunConfig
 from .events import EventBus
 from .llm import LLM, LLMError
 from .models import FindingStore
-from .scope import ScopeGuard
+from .scope import ScopeGuard, ScopeViolation
 from .state import AttackSurface
 from .tools import RateGovernor, Toolkit
 
@@ -94,6 +94,19 @@ class Conductor:
     def stop(self):
         self.kill.set()
 
+    async def _safe(self, agent, plan: dict, label: str) -> list[str]:
+        """Run one recon agent; a failure degrades to an error event
+        instead of killing the whole run."""
+        try:
+            return await agent.run(plan)
+        except ScopeViolation as e:
+            await self.bus.publish("error", "conductor",
+                                   f"scope violation in {label} — skipped: {e}")
+        except Exception as e:
+            await self.bus.publish("error", "conductor",
+                                   f"{label} failed: {type(e).__name__}: {e}")
+        return []
+
     async def run(self):
         t0 = time.time()
         deadline = t0 + self.cfg.budget_minutes * 60
@@ -105,17 +118,17 @@ class Conductor:
         await self.bus.publish("status", "conductor",
                                f"scope allowlist domains={sorted(self.guard.domains)} hosts={sorted(self.guard.hosts)} private={self.guard.allow_private}")
         try:
-            await self.scout.run({"target": self.cfg.target})
-            await self.cart.run({"hosts": sorted(self.surface.hosts)[:5]})
+            await self._safe(self.scout, {"target": self.cfg.target}, "scout")
+            await self._safe(self.cart, {"hosts": sorted(self.surface.hosts)[:5]}, "cartographer")
             # always map APIs + try to unmask origin — cheap, high value, LLM-free
-            await self.apiscan.run({"hosts": sorted(self.surface.hosts)[:3]})
+            await self._safe(self.apiscan, {"hosts": sorted(self.surface.hosts)[:3]}, "apiscan")
             apex = self.surface.root_target
             if apex.startswith("www."):
                 apex = apex[4:]
-            await self.origin.run({"apex": apex})
-            await self.cvemap.run({})
-            await self.aiprobe.run({})
-            await self.authprobe.run({})
+            await self._safe(self.origin, {"apex": apex}, "origin")
+            await self._safe(self.cvemap, {}, "cvemap")
+            await self._safe(self.aiprobe, {}, "aiprobe")
+            await self._safe(self.authprobe, {}, "authprobe")
             if self.cfg.recon_only:
                 await self.bus.publish("status", "conductor",
                                        "recon_only mode: skipping all hunting/attack phases")
@@ -143,7 +156,16 @@ class Conductor:
                     plan = move.get("plan", {})
                     await self.bus.publish("phase", "conductor",
                                            f"-> {agent.name}: {move.get('why', '')[:100]}")
-                    summaries = await agent.run(plan)
+                    try:
+                        summaries = await agent.run(plan)
+                    except ScopeViolation as e:
+                        await self.bus.publish("error", "conductor",
+                                               f"scope violation in {agent.name} move — skipped: {e}")
+                        continue
+                    except Exception as e:
+                        await self.bus.publish("error", "conductor",
+                                               f"{agent.name} move failed: {type(e).__name__}: {e}")
+                        continue
                     for s in summaries or []:
                         await self.bus.publish("log", agent.name, s)
                     if move["agent"] == "hunter":
@@ -159,6 +181,12 @@ class Conductor:
         except Exception as e:
             await self.bus.publish("error", "conductor", f"run crashed: {type(e).__name__}: {e}")
             import traceback; traceback.print_exc()
+            try:
+                self.report_path = await self.write_report()
+                await self.bus.publish("status", "conductor",
+                                       f"crashed but partial report saved: {self.report_path}")
+            except Exception:
+                pass
         finally:
             await self.tk.close()
             self.finished.set()

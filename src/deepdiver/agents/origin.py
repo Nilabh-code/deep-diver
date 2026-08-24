@@ -108,32 +108,114 @@ class OriginHunter(BaseAgent):
         host, status, title, headers, length, normal, bypass, differs = best
         # extra probe: bare-IP + Host header (works even if SNI-based routing)
         host_probe = await self._bare_ip_probe(ip, host)
+        # strict TLS verification: cert must chain to trust root AND cover the
+        # hostname — proves the server holds credentials for the domain (real
+        # origin, not a fake proxy) and attributes it to the domain owner.
+        cert = await self._cert_check(ip, host)
+        cert_dns = await self._cert_check(None, host)
+        tls_ok = cert["chain_ok"] and cert["san_ok"]
+        same_cert = bool(cert["fingerprint"]) and cert["fingerprint"] == cert_dns["fingerprint"]
         sig_hdrs = {k: v for k, v in (headers or {}).items()
                     if k in ("server", "x-powered-by", "via", "www-authenticate")}
         self.surf.add_note(
             f"origin {ip} verified serving {host} "
             f"({'CDN-bypass' if bypass else 'direct'}/{'DIFFERS' if differs else 'same'}"
-            f"/host-hdr:{'yes' if host_probe else 'no'}, org={org})")
-        sev = "high" if bypass else ("medium" if differs else "medium")
+            f"/host-hdr:{'yes' if host_probe else 'no'}"
+            f"/tls:{'VALID' if tls_ok else 'MISMATCH'}"
+            f"/same-cert-as-dns:{'yes' if same_cert else 'no'}, org={org})")
+        if not cert["connect"]:
+            await self.say(f"no TLS service on {ip}:443 for {host} — skipping finding")
+            return found
+        sev = "high" if (bypass and tls_ok) else "medium"
+        final_status = "confirmed" if tls_ok else "candidate"
         await self.record(
             title=f"origin exposure: {ip} serves {host}"
-                  f"{' — WAF/CDN bypass' if bypass else ''}",
+                  f"{' — WAF/CDN bypass' if bypass else ''}"
+                  f"{'' if tls_ok else ' (TLS unverified — needs manual check)'}",
             severity=sev, category="origin-disclosure",
             endpoint=f"https://{host} (ip {ip}, org={org or '?'})",
             evidence=(
                 f"curl --resolve {host}:443:{ip} -> HTTP {status} title={title!r} len={length}B\n"
                 f"origin headers: {json.dumps(sig_hdrs, indent=1)}\n"
                 f"bare-IP+Host probe: {host_probe or 'no-route'}\n"
+                f"TLS: chain={cert['verify_code']} san-match={cert['san_ok']} "
+                f"-> {'VALID for ' + host if tls_ok else 'NOT VERIFIED'}\n"
+                f"cert subject: {cert['subject']}\n"
+                f"cert issuer: {cert['issuer']}\n"
+                f"cert SAN: {cert['san']}\n"
+                f"cert notAfter: {cert['not_after']}\n"
+                f"cert sha256: {cert['fingerprint']}\n"
+                f"same cert as public DNS view: {same_cert} (dns-view sha256: {cert_dns['fingerprint'] or 'n/a'})\n"
                 f"CDN headers present on normal view: {normal_is_cdn}, on origin view: {resolve_is_cdn}\n"
                 f"view differs from public: {differs}\n"
                 f"cluster hosts on {ip}: {', '.join(sorted(hosts)[:8])}"),
             repro=f"curl -sk --resolve {host}:443:{ip} https://{host}/ -o /dev/null -w '%{{http_code}}'\n"
-                  f"curl -sk https://{ip}/ -H 'Host: {host}' -o /dev/null -w '%{{http_code}}' -k",
+                  f"curl -sk https://{ip}/ -H 'Host: {host}' -o /dev/null -w '%{{http_code}}' -k\n"
+                  f"echo | openssl s_client -connect {ip}:443 -servername {host} 2>/dev/null | openssl x509 -noout -subject -ext subjectAltName",
             impact="WAF/CDN bypass or direct origin exposure: rate limits, WAF rules and "
                    "front-door IP allowlists do not apply to this path",
-            cvss=7.2 if (bypass or differs) else 6.0, status="confirmed", bounty_ready=True)
-        found.append(f"origin verified {ip} -> {host} ({len(hosts)} hosts)")
+            cvss=7.2 if (bypass and tls_ok) else (6.0 if tls_ok else 4.0),
+            status=final_status, bounty_ready=tls_ok)
+        found.append(f"origin {'verified' if tls_ok else 'unverified-tls'} {ip} -> {host} ({len(hosts)} hosts)")
         return found
+
+    async def _cert_check(self, ip: str | None, host: str) -> dict:
+        """Strict TLS verification: does the endpoint present a cert that chains
+        to a trusted root AND whose SAN covers `host`?
+
+        This is the anti-fake-proxy test — an attacker-run proxy cannot hold a
+        CA-issued cert for a hostname it doesn't control. Also the attribution
+        anchor: the cert ties the server to the domain owner. `ip=None` checks
+        the host's normal DNS resolution (used for fingerprint comparison).
+        """
+        target = f"{ip}:443" if ip else f"{host}:443"
+        tmp = f"/tmp/opencode/sclient-{ip or 'dns'}.txt"
+        script = (
+            f"echo | openssl s_client -connect {target} -servername {host} "
+            f"2>/dev/null > {tmp}; "
+            f"openssl x509 -in {tmp} -noout -sha256 -fingerprint -subject -issuer -enddate 2>/dev/null; "
+            f"echo '---SAN---'; "
+            f"openssl x509 -in {tmp} -noout -ext subjectAltName 2>/dev/null; "
+            f"echo '---VERIFY---'; "
+            f"grep -m1 'Verify return code' {tmp}"
+        )
+        r = await self.tk.run_cmd(["bash", "-c", script], timeout=25)
+        self.step(0.2)
+        out = r.output or ""
+        res = {"connect": bool(out.strip()), "chain_ok": False, "san_ok": False,
+               "verify_code": "?", "fingerprint": "", "subject": "", "issuer": "",
+               "not_after": "", "san": ""}
+        m = re.search(r"Verify return code: (\d+) \(([^)]*)\)", out)
+        if m:
+            res["verify_code"] = f"{m.group(1)} ({m.group(2)})"
+            res["chain_ok"] = m.group(1) == "0"
+        m = re.search(r"sha256 Fingerprint=([0-9A-Fa-f:]+)", out)
+        if m:
+            res["fingerprint"] = m.group(1).upper()
+        m = re.search(r"subject=(.*)", out)
+        if m:
+            res["subject"] = m.group(1).strip()[:120]
+        m = re.search(r"issuer=(.*)", out)
+        if m:
+            res["issuer"] = m.group(1).strip()[:120]
+        m = re.search(r"notAfter=(.*)", out)
+        if m:
+            res["not_after"] = m.group(1).strip()
+        san_text = out.split("---SAN---", 1)[1].split("---VERIFY---", 1)[0] if "---SAN---" in out else ""
+        sans = re.findall(r"DNS:([^,\s]+)", san_text)
+        res["san"] = ",".join(sans)[:200]
+        host_l = host.lower()
+        for n in sans:
+            n = n.lower()
+            if n.startswith("*."):
+                base = n[2:]
+                if host_l.endswith("." + base) and host_l.count(".") == base.count(".") + 1:
+                    res["san_ok"] = True
+                    break
+            elif host_l == n:
+                res["san_ok"] = True
+                break
+        return res
 
     async def _bare_ip_probe(self, ip: str, host: str) -> str | None:
         cmd = ["curl", "-sk", "--max-time", "8", f"https://{ip}/", "-H", f"Host: {host}",

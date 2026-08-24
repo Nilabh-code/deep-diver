@@ -19,7 +19,11 @@ def main():
 
     serve = sub.add_parser("serve", help="launch web dashboard (self-service scanning)")
     serve.add_argument("--port", type=int, default=8911)
-    serve.add_argument("--host", default="0.0.0.0")
+    serve.add_argument("--host", default="127.0.0.1",
+                       help="bind address (default loopback; use 0.0.0.0 only with --token)")
+    serve.add_argument("--token", default="",
+                       help="require this token on all /api/* routes (X-DV-Token header or ?token=); "
+                            "persist to ~/.config/deep-diver/token so watchdog restarts keep it")
 
     run = sub.add_parser("run", help="one-shot headless scan: deepdiver run <URL>")
     run.add_argument("target")
@@ -38,8 +42,18 @@ def main():
 
     args = p.parse_args()
     if args.cmd == "serve":
-        from .dashboard.app import serve
-        print(f"deep-diver dashboard: http://localhost:{args.port}")
+        from .dashboard.app import serve, TOKEN_FILE
+        if args.token:
+            TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+            TOKEN_FILE.write_text(args.token.strip())
+            TOKEN_FILE.chmod(0o600)
+            print(f"dashboard token enabled ({TOKEN_FILE})")
+        if args.host not in ("127.0.0.1", "localhost", "::1"):
+            import os
+            if not (args.token or os.getenv("DEEPDIVER_TOKEN") or TOKEN_FILE.exists()):
+                print(f"WARNING: binding {args.host} WITHOUT a token — anyone reachable can "
+                      f"launch scans and read reports. Use --token.")
+        print(f"deep-diver dashboard: http://{args.host}:{args.port}")
         print("open it, paste a URL, LAUNCH HUNT. reports land in ./runs/")
         serve(args.port, args.host)
     elif args.cmd == "run":

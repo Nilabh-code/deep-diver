@@ -19,6 +19,11 @@ class Cartographer(BaseAgent):
         for host in hosts[: plan.get("max_hosts", 5)]:
             if self.steps["used"] >= self.steps["max"]:
                 break
+            try:
+                self.tk.guard.check_url(host if "://" in host else f"https://{host}")
+            except Exception:
+                await self.say(f"skipping out-of-scope crawl target: {host}", kind="error")
+                continue
             await self.say(f"crawling {host}")
             await self._katana(host)
             if self.tk.browser:
@@ -70,6 +75,10 @@ class Cartographer(BaseAgent):
             self.surf.titles.setdefault(u, t)
         for m, urls in meta.get("api_requests", {}).items():
             for u in urls:
+                try:
+                    self.tk.guard.check_url(u)
+                except Exception:
+                    continue
                 self.surf.urls.add(u)
         await self.say(
             f"browser crawl: {meta.get('pages', 0)} pages, "

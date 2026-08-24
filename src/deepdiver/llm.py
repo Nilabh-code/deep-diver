@@ -38,10 +38,19 @@ def extract_json(text: str):
             else:
                 continue
             break
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        raise LLMError(f"model returned non-JSON: {e}") from e
+    candidates = [
+        text,
+        re.sub(r",\s*([}\]])", r"\1", text),              # strip trailing commas
+        re.sub(r"\s+", " ", text),                        # collapse whitespace/newlines
+        re.sub(r",\s*([}\]])", r"\1", re.sub(r"\s+", " ", text)),
+    ]
+    last_err = None
+    for cand in candidates:
+        try:
+            return json.loads(cand)
+        except json.JSONDecodeError as e:
+            last_err = e
+    raise LLMError(f"model returned non-JSON: {last_err}") from last_err
 
 
 class LLM:

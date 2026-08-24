@@ -216,10 +216,12 @@ const SAVE_KEYS=['target','scope','base_url','api_key','model','mode','budget','
 function saveCfg(){localStorage.setItem('dv-cfg',JSON.stringify(Object.fromEntries(SAVE_KEYS.map(k=>[k,$(k).value]))))}
 (function(){try{const c=JSON.parse(localStorage.getItem('dv-cfg')||'{}');for(const k of SAVE_KEYS)if(c[k]!==undefined)$(k).value=c[k];}catch(e){}})();
 setInterval(saveCfg,3000);
+const TOK=()=>new URLSearchParams(location.search).get('token')||'';
+const TH=(h)=>({...h,'X-DV-Token':TOK()});
 
 /* ---------------- SSE ---------------- */
 function connect(){
-  es=new EventSource('/api/events');
+  es=new EventSource('/api/events'+(TOK()?'?token='+encodeURIComponent(TOK()):''));
   es.onmessage=e=>{
     try{renderEv(JSON.parse(e.data))}catch(x){}
   };
@@ -274,7 +276,7 @@ function drawFindings(){
 }
 async function refreshFindings(){
   try{
-    const r=await fetch('/api/state'); latestState=await r.json();
+    const r=await fetch('/api/state',{headers:TH({})}); latestState=await r.json();
   }catch(e){return}
   setStatus(latestState.running);
   $('hSteps').textContent=Math.round(latestState.steps?.used||0);
@@ -307,16 +309,16 @@ async function start(){
   const b=body();
   if(!b.target){alert('enter a target URL');return}
   if(!b.scope){b.scope=b.target;$('scope').value=b.target}
-  const r=await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+  const r=await fetch('/api/start',{method:'POST',headers:TH({'Content-Type':'application/json'}),body:JSON.stringify(b)});
   const j=await r.json();
   if(!r.ok)alert(j.error||'failed to start');
   else{$('feed').innerHTML='';loadReport()}
 }
-async function stop(){if(confirm('kill the hunt?'))await fetch('/api/stop',{method:'POST'})}
+async function stop(){if(confirm('kill the hunt?'))await fetch('/api/stop',{method:'POST',headers:TH({})})}
 async function pingLLM(){
   const el=$('llmState');el.textContent='pinging…';el.className='';
   const b=body();
-  const r=await fetch('/api/llm/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+  const r=await fetch('/api/llm/ping',{method:'POST',headers:TH({'Content-Type':'application/json'}),body:JSON.stringify(b)});
   const j=await r.json();
   el.className=j.ok?'ok':'bad';
   el.textContent=j.ok?`✓ endpoint alive · ${j.models?.length||0} models · current: ${b.model}`:`✗ ${j.error}`;
@@ -324,7 +326,7 @@ async function pingLLM(){
 async function listModels(){
   const el=$('llmState');el.textContent='listing…';
   const b=body();
-  const r=await fetch('/api/llm/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+  const r=await fetch('/api/llm/ping',{method:'POST',headers:TH({'Content-Type':'application/json'}),body:JSON.stringify(b)});
   const j=await r.json();
   if(j.ok){
     el.className='ok';
@@ -332,11 +334,11 @@ async function listModels(){
   }else{el.className='bad';el.textContent='✗ '+j.error}
 }
 async function loadReport(){
-  const r=await fetch('/api/report');
+  const r=await fetch('/api/report',{headers:TH({})});
   $('reportPre').textContent=r.ok?await r.text():'_no report yet_';
 }
 async function copyReport(){
-  const r=await fetch('/api/report');
+  const r=await fetch('/api/report',{headers:TH({})});
   if(r.ok){await navigator.clipboard.writeText(await r.text());alert('report copied to clipboard')}
 }
 function switchTab(i,el){

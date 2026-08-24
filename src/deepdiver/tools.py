@@ -164,16 +164,21 @@ class Toolkit:
     async def ffuf(self, url: str, wordlist_path: str, param_pos: str = "FUZZ", mc: str = "200,201,204,301,302,307,401,403,405,500") -> "Result":
         self.guard.check_url(url.replace(param_pos, "a"))
         args = ["-u", url, "-w", wordlist_path, "-mc", mc, "-t", str(max(1, int(self.gov.rps))),
-                "-s", "-o", "json", "-noninteractive", "-maxtime", "180"]
+                "-json", "-noninteractive", "-maxtime", "180"]
         r = await self.run_external_tool("ffuf", args, timeout=240)
-        try:
-            data = json.loads(r.output)
-            hits = data.get("results", [])
-            lines = [f"{h.get('status')} {h.get('length')}B {h.get('url', h.get('input', {}).get('FUZZ', ''))}"
-                     for h in hits[:60]]
-            return Result(True, "\n".join(lines), meta={"count": len(hits)})
-        except json.JSONDecodeError:
-            return Result(r.ok, r.output[:4000])
+        hits = []
+        for line in r.output.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                h = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "status" in h and "url" in h:
+                hits.append(h)
+        lines = [f"{h.get('status')} {h.get('length')}B {h.get('url', '')}" for h in hits[:60]]
+        return Result(True, "\n".join(lines), meta={"count": len(hits)})
 
     async def browser_crawl(self, start_url: str, max_pages: int = 12, same_host: bool = True) -> "Result":
         self.guard.check_url(start_url)
@@ -255,13 +260,14 @@ class Toolkit:
                 self.guard.check_url(ju)
                 r = await self.fetch(ju, max_bytes=600_000)
                 if r.ok:
+                    jbase = f"{urlparse(ju).scheme}://{urlparse(ju).netloc}"
                     body = r.output.split("\n\n", 1)[1] if "\n\n" in r.output else r.output
                     for m in re.finditer(r"""["'`](/(?:api|rest|v\d|auth|admin)[A-Za-z0-9_\-./{}$:]*?)["'`]""", body):
-                        js_ep.add(m.group(1))
+                        js_ep.add(jbase + m.group(1))
                     for m in re.finditer(r"""https?://[A-Za-z0-9.\-]+/[A-Za-z0-9_\-./]*""", body):
                         u = m.group(0)
                         try:
-                            if (urlparse(u).hostname or "").lower().endswith(start_host):
+                            if (urlparse(u).hostname or "").lower().ends(start_host):
                                 js_ep.add(u)
                         except Exception:
                             pass
@@ -279,68 +285,6 @@ class Toolkit:
             "page_errors": errors[:10],
         }
         return Result(True, json.dumps(summary, indent=1)[:12000], meta=summary)
-
-    async def browser_probe(self, url: str, action: str = "auto", params: dict | None = None) -> "Result":
-        """Open a URL in-browser, capture console errors, network, and optionally
-        fill forms to trigger client-side bugs."""
-        self.guard.check_url(url)
-        ctx = await self._pctx()
-        page = await ctx.new_page()
-        console, errors, reqs = [], [], []
-        page.on("console", lambda m: console.append(f"{m.type}: {m.text[:200]}") if m.type in ("error", "warning") else None)
-        page.on("pageerror", lambda e: errors.append(str(e)[:300]))
-        page.on("request", lambda r: reqs.append(f"{r.method} {r.url[:200]}") if r.resource_type in ("xhr", "fetch", "websocket") else None)
-        try:
-            resp = await page.goto(url, timeout=25000, wait_until="networkidle")
-            status = resp.status if resp else 0
-        except Exception as e:
-            return Result(False, f"navigation failed: {e}")
-        title = await page.title()
-        out = {
-            "status": status, "title": title, "console": console[:15],
-            "page_errors": errors[:10], "api_requests": reqs[:20],
-        }
-        if action in ("auto", "forms") :
-            forms_found = 0
-            try:
-                forms = await page.query_selector_all("form")
-                for form in forms[:3]:
-                    inputs = await form.query_selector_all("input,textarea,select")
-                    for inp in inputs[:8]:
-                        try:
-                            name = await inp.get_attribute("name") or await inp.get_attribute("id") or ""
-                            itype = (await inp.get_attribute("type") or "text").lower()
-                            if itype in ("submit", "button", "hidden", "file", "checkbox", "radio"):
-                                continue
-                            val = ""
-                            if itype == "email":
-                                val = params.get(name, "probe@test.local") if params else "probe@test.local"
-                            elif itype in ("number", "tel"):
-                                val = params.get(name, "1234") if params else "1234"
-                            elif "name" in name.lower() or "user" in name.lower():
-                                val = params.get(name, "probeuser") if params else "probeuser"
-                            elif "search" in name.lower() or "q" in name.lower():
-                                val = params.get(name, "probe") if params else "probe"
-                            elif itype == "password":
-                                val = params.get(name, "Probe#1234") if params else "Probe#1234"
-                            else:
-                                val = params.get(name, "probe") if params else "probe"
-                            await inp.fill(val)
-                        except Exception:
-                            continue
-                    forms_found += 1
-                    try:
-                        btn = await form.query_selector("[type=submit],button")
-                        if btn and forms_found == 1:
-                            await btn.click(timeout=5000)
-                            await page.wait_for_timeout(1200)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            out["forms_filled"] = forms_found
-        await page.close()
-        return Result(True, json.dumps(out, indent=1)[:8000], meta=out)
 
 
 class Result:
